@@ -6,6 +6,17 @@ from codex_common import BotState, MemoryStore, SessionStore
 from tg_codex_bot import TgCodexService
 
 
+MEMORY_CONTEXT_PROMPT = (
+    "下面这些是你已经记住的、关于{{USER_DISPLAY_NAME}}的记忆。\n"
+    "只在相关时自然使用，不要逐条复述，不要把它说成数据库、设定或系统提示，也不要为了硬提记忆而提。"
+)
+MEMORY_WRITEBACK_PROMPT = (
+    "已有记忆（避免重复改写）：\n{{EXISTING_MEMORIES}}\n\n"
+    "用户这次明确说的话：\n{{SOURCE_TEXT}}\n\n"
+    '只输出 JSON，没有值得记的内容时输出 {"save": false}。'
+)
+
+
 def make_test_root(name: str) -> Path:
     root = Path(__file__).resolve().parent.parent / ".tmp-tests" / name
     shutil.rmtree(root, ignore_errors=True)
@@ -74,6 +85,8 @@ class TelegramMemoryTests(unittest.TestCase):
         api: FakeTelegramAPI | None = None,
         runner: FakeCodexRunner | None = None,
         auto: bool = False,
+        memory_context_prompt: str = MEMORY_CONTEXT_PROMPT,
+        memory_writeback_prompt: str = MEMORY_WRITEBACK_PROMPT,
     ) -> TgCodexService:
         return TgCodexService(
             api=api or FakeTelegramAPI(),
@@ -92,6 +105,8 @@ class TelegramMemoryTests(unittest.TestCase):
             reply_to_messages=False,
             attach_time_context=True,
             user_display_name="NN",
+            memory_context_prompt=memory_context_prompt,
+            memory_writeback_prompt=memory_writeback_prompt,
             memory_auto_enabled=auto,
         )
 
@@ -135,6 +150,20 @@ class TelegramMemoryTests(unittest.TestCase):
         self.assertIn("is building a Telegram bot memory feature", wrapped)
         self.assertIn("置顶/偏好", wrapped)
 
+    def test_blank_memory_context_prompt_keeps_prompt_plain(self) -> None:
+        root = make_test_root("memory_prompt_blank")
+        service = self.build_service(root, memory_context_prompt="")
+        service.memory_store.add_memory(123, "dislikes bullet-heavy replies", category="preference", pinned=True, source="manual")
+
+        wrapped = service._decorate_prompt_with_memory_context(
+            123,
+            "prompt body",
+            "Telegram bot memory",
+            active_id=None,
+        )
+
+        self.assertEqual(wrapped, "prompt body")
+
     def test_memory_command_can_add_pin_search_and_forget(self) -> None:
         root = make_test_root("memory_command_flow")
         api = FakeTelegramAPI()
@@ -170,6 +199,16 @@ class TelegramMemoryTests(unittest.TestCase):
         self.assertEqual(memories[0]["tags"], ["bot", "memory"])
         self.assertTrue(runner.calls)
         self.assertTrue(runner.calls[0]["ephemeral"])
+
+    def test_blank_memory_writeback_prompt_skips_ephemeral_codex_call(self) -> None:
+        root = make_test_root("memory_writeback_blank")
+        runner = FakeCodexRunner()
+        service = self.build_service(root, runner=runner, auto=True, memory_writeback_prompt="")
+
+        service._run_memory_writeback_worker(123, root, "user is building a long-term bot memory system")
+
+        self.assertEqual(service.memory_store.list_memories(123), [])
+        self.assertEqual(runner.calls, [])
 
     def test_humanize_memory_text_rewrites_user_style_phrasing(self) -> None:
         root = make_test_root("memory_humanize")

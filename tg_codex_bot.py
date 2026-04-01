@@ -20,7 +20,6 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from textwrap import dedent
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from codex_common import (
@@ -69,35 +68,10 @@ HEARTBEAT_POLL_INTERVAL_SEC = 15
 HEARTBEAT_CONVERSATION_COOLDOWN_SEC = 10 * 60
 HEARTBEAT_MAX_UNANSWERED = 4
 TOKYO_TZ = timezone(timedelta(hours=9), name="Asia/Tokyo")
-HEARTBEAT_SESSION_PROMPT = dedent(
-    """
-    你现在不是在回答问题，而是在合适的时候主动发一条简短消息。
-    请根据当前东京时间和最近对话上下文，写 1 到 3 句自然的中文消息。
-    语气像熟人之间的真实问候或轻碰一下，尽量具体，不要像客服、提醒、广播或打卡。
-    优先抓住最近聊过的一个小细节来开口；如果上下文不够，就顺着当前时间点或聊天氛围自然开始，不要编造。
-    不要泛泛地说“在吗”“今天怎么样”“记得吃饭休息”，除非上下文真的很适合。
-    可以轻轻调侃一下、顺手接住情绪，或者很短地表达惦记。
-    控制在 1 到 3 句，像聊天窗口里自然冒出来的一小段，不要像模板，不要像提醒，不要像广播。
-    不要提系统、心跳、自动触发、机器人、程序、定时。
-    不要列表、不要标题、不要解释、不要过度完整。
-    """
-).strip()
-HEARTBEAT_BANNED_PATTERNS = [
-    "在吗",
-    "最近怎么样",
-    "记得吃饭",
-    "记得早点休息",
-    "照顾好自己",
-    "只是来看看你",
-    "顺手来问候一下",
-]
-HEARTBEAT_TEMPLATE_MESSAGES = [
-    "路过留个声。你这会儿在忙什么呀？",
-    "我来冒个泡，看看你今天过得怎么样。",
-    "留一句，不急着回，忙完再说也行。",
-    "看到这个时间点，顺手来问候你一下。",
-    "我在这边，有空的话来接着聊。",
-]
+HEARTBEAT_SESSION_PROMPT = ""
+HEARTBEAT_BANNED_PATTERNS: List[str] = []
+HEARTBEAT_TEMPLATE_MESSAGES: List[str] = []
+HEARTBEAT_FOLLOWUP_TEMPLATE_MESSAGES: List[str] = []
 CONVERSATION_TARGET_CHARS = 110
 CONVERSATION_MAX_CHARS = 180
 CONVERSATION_MIN_SPLIT_CHARS = 90
@@ -119,33 +93,9 @@ MEMORY_CATEGORY_LABELS = {
     "relationship": "关系",
     "general": "记忆",
 }
-NEW_THREAD_PERSONA_PROMPT = dedent(
-    """
-    你正在 Telegram 里和同一个人持续聊天。
-    你的目标不是写正式答复，而是像一个长期在线、熟悉上下文的人那样自然接话。
-
-    风格要求：
-    1. 口语化、真诚、有生活感，不要像客服、公告或心理咨询模板。
-    2. 优先接住对方刚刚说的话，再决定要不要追问或补充建议。
-    3. 篇幅以短到中等为主，除非对方真的需要更完整的帮助。
-    4. 不要机械复述问题，不要过度总结，不要突然板书式分点。
-    5. 不要把自己描述成 AI、模型、程序或系统设定。
-
-    节奏要求：
-    1. 有些时候轻轻接一句就够了，有些时候可以多说一点，关键是顺着当下气氛。
-    2. 如果对方只是随口说说、碎碎念、发呆或撒娇，先接住，不要急着分析。
-    3. 如果对方情绪明显不好，先理解具体发生了什么，再给一两个现实的小建议。
-
-    时间感：
-    1. 默认带着东京时间的日常感。
-    2. 早上、白天、晚上、深夜的语气要自然不同，但不要机械播报时间。
-
-    互动方式：
-    1. 保持亲近、自然、有人味。
-    2. 可以在合适的时候轻轻主动一点，但不要为了活跃而刻意表演。
-    3. 多用具体、细小、真实的生活细节，少用空泛的大词。
-    """
-).strip()
+NEW_THREAD_PERSONA_PROMPT = ""
+MEMORY_CONTEXT_PROMPT = ""
+MEMORY_WRITEBACK_PROMPT = ""
 
 
 def _resolve_local_path(raw_path: Optional[str]) -> Optional[Path]:
@@ -203,6 +153,15 @@ def _load_list_override(default: List[str], *, inline_env_name: str, path_env_na
     except Exception as e:
         log(f"[warn] failed to read {path_env_name} from {path}: {e}")
         return list(default)
+
+
+def _render_prompt_template(template: str, **values: str) -> str:
+    rendered = (template or "").strip()
+    if not rendered:
+        return ""
+    for key, value in values.items():
+        rendered = rendered.replace(f"{{{{{key}}}}}", value)
+    return rendered.strip()
 
 def parse_allowed_user_ids(raw: Optional[str]) -> Optional[Set[int]]:
     if not raw:
@@ -804,6 +763,9 @@ class TgCodexService:
         heartbeat_session_prompt: str = HEARTBEAT_SESSION_PROMPT,
         heartbeat_banned_patterns: Optional[List[str]] = None,
         heartbeat_template_messages: Optional[List[str]] = None,
+        heartbeat_followup_template_messages: Optional[List[str]] = None,
+        memory_context_prompt: Optional[str] = MEMORY_CONTEXT_PROMPT,
+        memory_writeback_prompt: Optional[str] = MEMORY_WRITEBACK_PROMPT,
         memory_auto_enabled: bool = True,
         tts_mode: str = "auto",
         tts_max_chars: int = DEFAULT_TTS_MAX_CHARS,
@@ -825,10 +787,33 @@ class TgCodexService:
         self.attach_time_context = bool(attach_time_context)
         self.user_display_name = (user_display_name or "对方").strip() or "对方"
         self.new_thread_persona_enabled = bool(new_thread_persona_enabled)
-        self.new_thread_persona_prompt = (new_thread_persona_prompt or NEW_THREAD_PERSONA_PROMPT).strip() or NEW_THREAD_PERSONA_PROMPT
-        self.heartbeat_session_prompt = (heartbeat_session_prompt or HEARTBEAT_SESSION_PROMPT).strip() or HEARTBEAT_SESSION_PROMPT
-        self.heartbeat_banned_patterns = [item for item in (heartbeat_banned_patterns or HEARTBEAT_BANNED_PATTERNS) if str(item).strip()] or list(HEARTBEAT_BANNED_PATTERNS)
-        self.heartbeat_template_messages = [item for item in (heartbeat_template_messages or HEARTBEAT_TEMPLATE_MESSAGES) if str(item).strip()] or list(HEARTBEAT_TEMPLATE_MESSAGES)
+        self.new_thread_persona_prompt = (
+            NEW_THREAD_PERSONA_PROMPT if new_thread_persona_prompt is None else str(new_thread_persona_prompt)
+        ).strip()
+        self.heartbeat_session_prompt = (
+            HEARTBEAT_SESSION_PROMPT if heartbeat_session_prompt is None else str(heartbeat_session_prompt)
+        ).strip()
+        self.heartbeat_banned_patterns = (
+            [str(item).strip() for item in HEARTBEAT_BANNED_PATTERNS if str(item).strip()]
+            if heartbeat_banned_patterns is None
+            else [str(item).strip() for item in heartbeat_banned_patterns if str(item).strip()]
+        )
+        self.heartbeat_template_messages = (
+            [str(item).strip() for item in HEARTBEAT_TEMPLATE_MESSAGES if str(item).strip()]
+            if heartbeat_template_messages is None
+            else [str(item).strip() for item in heartbeat_template_messages if str(item).strip()]
+        )
+        self.heartbeat_followup_template_messages = (
+            [str(item).strip() for item in HEARTBEAT_FOLLOWUP_TEMPLATE_MESSAGES if str(item).strip()]
+            if heartbeat_followup_template_messages is None
+            else [str(item).strip() for item in heartbeat_followup_template_messages if str(item).strip()]
+        )
+        self.memory_context_prompt = (
+            MEMORY_CONTEXT_PROMPT if memory_context_prompt is None else str(memory_context_prompt)
+        ).strip()
+        self.memory_writeback_prompt = (
+            MEMORY_WRITEBACK_PROMPT if memory_writeback_prompt is None else str(memory_writeback_prompt)
+        ).strip()
         self.memory_auto_enabled = bool(memory_auto_enabled)
         self.tts_mode = (tts_mode or "auto").strip().lower() or "auto"
         self.tts_max_chars = max(40, int(tts_max_chars))
@@ -1355,13 +1340,18 @@ class TgCodexService:
         cleaned = (prompt or "").strip()
         if not cleaned:
             return cleaned
+        if not self.memory_context_prompt:
+            return cleaned
         memories = self._select_memories_for_prompt(user_id, memory_query_text, active_id)
         if not memories:
             return cleaned
-        lines = [
-            f"下面这些是你已经记住的、关于{self.user_display_name}的记忆。",
-            "只在相关时自然使用，不要逐条复述，不要把它说成数据库、设定或系统提示，也不要为了硬提记忆而提。",
-        ]
+        header = _render_prompt_template(
+            self.memory_context_prompt,
+            USER_DISPLAY_NAME=self.user_display_name,
+        )
+        if not header:
+            return cleaned
+        lines = [line for line in header.splitlines() if line.strip()]
         for item in memories:
             category_label = self._memory_category_label(item.get("category"))
             pinned_prefix = "置顶/" if item.get("pinned") else ""
@@ -1369,6 +1359,8 @@ class TgCodexService:
         return "\n".join(lines) + "\n\n" + cleaned
 
     def _build_memory_writeback_prompt(self, user_id: int, source_text: str) -> str:
+        if not self.memory_writeback_prompt:
+            return ""
         recent_memories = self.memory_store.list_memories(user_id, limit=8)
         existing_lines = [
             f"- {item.get('text')}"
@@ -1376,52 +1368,12 @@ class TgCodexService:
             if str(item.get("text") or "").strip()
         ]
         existing_text = "\n".join(existing_lines) if existing_lines else "- 暂无"
-        return dedent(
-            f"""
-            你是一个“长期记忆整理器”。你的任务是：只根据用户这一次明确说出的内容，判断是否值得写进长期记忆。
-
-            适合写入长期记忆的内容：
-            - 稳定偏好、长期讨厌、明确边界
-            - 持续中的项目、计划、烦恼、目标
-            - 关系称呼、长期背景、反复提到的生活习惯
-
-            不适合写入长期记忆的内容：
-            - 寒暄、撒娇、一次性回复
-            - 纯当下临时任务、目录路径、文件名、一次性报错
-            - 你自己的猜测、延伸、脑补
-
-            写法要求：
-            - 记忆文本要像长期可复用的自然备注，不要像系统日志
-            - 尽量避免“用户”“该用户”这种生硬代称，优先用自然陈述
-            - 尽量避免一句话里重复同义信息
-            - 如果对话里已经有固定称呼，可以沿用；没有就直接写自然句子
-
-            已有记忆（避免重复改写）：
-            {existing_text}
-
-            用户这次明确说的话：
-            {source_text}
-
-            只输出 JSON，不要解释，不要加代码块。
-            没有值得记的内容时输出：
-            {{"save": false}}
-
-            有值得记的内容时输出：
-            {{
-              "save": true,
-              "memories": [
-                {{
-                  "text": "一句简洁、可长期复用的记忆",
-                  "category": "profile|preference|project|ongoing|boundary|relationship|general",
-                  "tags": ["最多4个短标签"],
-                  "pinned": false
-                }}
-              ]
-            }}
-
-            最多输出 3 条记忆。
-            """
-        ).strip()
+        return _render_prompt_template(
+            self.memory_writeback_prompt,
+            USER_DISPLAY_NAME=self.user_display_name,
+            EXISTING_MEMORIES=existing_text,
+            SOURCE_TEXT=source_text,
+        )
 
     @staticmethod
     def _strip_code_fence(text: str) -> str:
@@ -1478,6 +1430,8 @@ class TgCodexService:
     def _schedule_memory_writeback(self, user_id: int, cwd: Path, source_text: Optional[str]) -> None:
         if not self.memory_auto_enabled:
             return
+        if not self.memory_writeback_prompt:
+            return
         normalized_text = self._normalize_memory_source_text(source_text)
         if not normalized_text:
             return
@@ -1490,6 +1444,8 @@ class TgCodexService:
 
     def _run_memory_writeback_worker(self, user_id: int, cwd: Path, source_text: str) -> None:
         prompt = self._build_memory_writeback_prompt(user_id, source_text)
+        if not prompt:
+            return
         try:
             _, answer, stderr_text, return_code = self.codex.run_prompt(
                 prompt=prompt,
@@ -1527,7 +1483,7 @@ class TgCodexService:
         cleaned = (prompt or "").strip()
         if not cleaned:
             return cleaned
-        if active_id or not self.new_thread_persona_enabled:
+        if active_id or not self.new_thread_persona_enabled or not self.new_thread_persona_prompt:
             return cleaned
         return (
             f"{self.new_thread_persona_prompt}\n\n"
@@ -1578,15 +1534,18 @@ class TgCodexService:
         last_user_at: Optional[int],
         force: bool = False,
     ) -> str:
+        if not self.heartbeat_session_prompt:
+            return ""
         idle_minutes = max(0, int((now_ts - (last_user_at or now_ts)) // 60))
         local_now = self._tokyo_datetime(now_ts).strftime("%Y-%m-%d %H:%M")
-        banned_patterns = "、".join(f"“{pattern}”" for pattern in self.heartbeat_banned_patterns)
         lines = [
             self.heartbeat_session_prompt,
             f"当前东京时间：{local_now}",
             f"距离用户上次发消息约：{idle_minutes} 分钟",
-            f"尽量避免这些泛泛开场或固定句式：{banned_patterns}。除非当前上下文真的很适合。",
         ]
+        banned_patterns = "、".join(f"“{pattern}”" for pattern in self.heartbeat_banned_patterns)
+        if banned_patterns:
+            lines.append(f"尽量避免这些泛泛开场或固定句式：{banned_patterns}。除非当前上下文真的很适合。")
         if force:
             lines.append("这是用户刚刚手动触发的一次主动消息请求，直接发消息，不要输出 SKIP。")
             return "\n".join(lines)
@@ -1639,13 +1598,12 @@ class TgCodexService:
 
     def _render_template_heartbeat(self, unanswered_count: int = 0) -> str:
         if unanswered_count <= 0:
+            if not self.heartbeat_template_messages:
+                return ""
             return random.choice(self.heartbeat_template_messages)
-        followups = [
-            "我又来碰碰你。今天是不是一直没闲下来？",
-            "还没冒头呀，你这会儿是在忙，还是单纯懒得理我？",
-            "又安静了好一阵，我来看看你是不是还埋在事情里。",
-        ]
-        return random.choice(followups)
+        if not self.heartbeat_followup_template_messages:
+            return ""
+        return random.choice(self.heartbeat_followup_template_messages)
 
     def _run_heartbeat_worker(
         self,
@@ -1665,6 +1623,11 @@ class TgCodexService:
             last_user_at=last_user_at,
             force=force,
         )
+        if not prompt:
+            self.state.mark_heartbeat_skipped(user_id)
+            self.state.set_heartbeat_not_before(user_id, int(time.time()) + interval_sec)
+            self.running_prompts.finish(user_id, context_session_id)
+            return
         try:
             thread_id, answer, stderr_text, return_code = self.codex.run_prompt(
                 prompt=prompt,
@@ -1734,8 +1697,10 @@ class TgCodexService:
             return True
 
         text = self._render_template_heartbeat(int(heartbeat.get("unanswered_count") or 0))
-        if force:
-            text = f"{text}\n\n想说话了就来叫我。"
+        if not text:
+            self.state.mark_heartbeat_skipped(user_id)
+            self.state.set_heartbeat_not_before(user_id, int(time.time()) + interval_sec)
+            return False
         self._send_conversation_message(chat_id, text, user_id=user_id)
         self.state.mark_heartbeat_sent(user_id, chat_id, cwd=str(cwd))
         self.state.set_heartbeat_not_before(user_id, int(time.time()) + interval_sec)
@@ -2918,6 +2883,21 @@ def build_service() -> TgCodexService:
         inline_env_name="TG_HEARTBEAT_TEMPLATE_MESSAGES",
         path_env_name="TG_HEARTBEAT_TEMPLATE_MESSAGES_PATH",
     )
+    tg_heartbeat_followup_template_messages = _load_list_override(
+        HEARTBEAT_FOLLOWUP_TEMPLATE_MESSAGES,
+        inline_env_name="TG_HEARTBEAT_FOLLOWUP_TEMPLATE_MESSAGES",
+        path_env_name="TG_HEARTBEAT_FOLLOWUP_TEMPLATE_MESSAGES_PATH",
+    )
+    tg_memory_context_prompt = _load_text_override(
+        MEMORY_CONTEXT_PROMPT,
+        inline_env_name="TG_MEMORY_CONTEXT_PROMPT",
+        path_env_name="TG_MEMORY_CONTEXT_PROMPT_PATH",
+    )
+    tg_memory_writeback_prompt = _load_text_override(
+        MEMORY_WRITEBACK_PROMPT,
+        inline_env_name="TG_MEMORY_WRITEBACK_PROMPT",
+        path_env_name="TG_MEMORY_WRITEBACK_PROMPT_PATH",
+    )
     memory_auto_enabled = parse_bool_env(env("TG_MEMORY_AUTO_ENABLED"), True)
 
     if require_allowlist and not allowed_user_ids:
@@ -3063,6 +3043,14 @@ def build_service() -> TgCodexService:
         "[info] Telegram memory "
         f"(path: {memory_path}, auto writeback: {'enabled' if memory_auto_enabled else 'disabled'})"
     )
+    if not tg_new_thread_persona_prompt:
+        log("[info] Telegram new-thread persona prompt is blank by default")
+    if not tg_heartbeat_session_prompt:
+        log("[info] Telegram heartbeat prompt is blank by default")
+    if not tg_memory_context_prompt:
+        log("[info] Telegram memory context prompt is blank by default")
+    if memory_auto_enabled and not tg_memory_writeback_prompt:
+        log("[info] Telegram memory writeback prompt is blank by default; auto writeback will stay idle")
     if codex_idle_timeout_sec > 0:
         log(f"[info] Codex idle timeout enabled ({codex_idle_timeout_sec}s)")
     else:
@@ -3105,6 +3093,9 @@ def build_service() -> TgCodexService:
         heartbeat_session_prompt=tg_heartbeat_session_prompt,
         heartbeat_banned_patterns=tg_heartbeat_banned_patterns,
         heartbeat_template_messages=tg_heartbeat_template_messages,
+        heartbeat_followup_template_messages=tg_heartbeat_followup_template_messages,
+        memory_context_prompt=tg_memory_context_prompt,
+        memory_writeback_prompt=tg_memory_writeback_prompt,
         memory_auto_enabled=memory_auto_enabled,
         tts_mode=tg_tts_mode,
         tts_max_chars=tg_tts_max_chars,

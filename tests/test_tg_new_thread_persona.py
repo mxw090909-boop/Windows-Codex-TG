@@ -3,7 +3,10 @@ import unittest
 from pathlib import Path
 
 from codex_common import BotState, MemoryStore, SessionStore
-from tg_codex_bot import NEW_THREAD_PERSONA_PROMPT, TgCodexService
+from tg_codex_bot import TgCodexService
+
+
+CUSTOM_PERSONA_PROMPT = "CUSTOM PERSONA"
 
 
 def make_test_root(name: str) -> Path:
@@ -47,7 +50,7 @@ class TelegramNewThreadPersonaTests(unittest.TestCase):
         name: str,
         *,
         enabled: bool = True,
-        persona_prompt: str = NEW_THREAD_PERSONA_PROMPT,
+        persona_prompt: str = "",
     ) -> TgCodexService:
         root = make_test_root(name)
         return TgCodexService(
@@ -73,12 +76,12 @@ class TelegramNewThreadPersonaTests(unittest.TestCase):
         )
 
     def test_new_thread_prompt_injects_hidden_persona_once(self) -> None:
-        service = self.build_service("new_thread_enabled")
+        service = self.build_service("new_thread_enabled", persona_prompt=CUSTOM_PERSONA_PROMPT)
         prompt = "当前时间：2026-03-30 21:10 (Asia/Tokyo)\nNN说：晚饭吃晚了"
 
         wrapped = service._decorate_new_thread_prompt(prompt, active_id=None)
 
-        self.assertIn(NEW_THREAD_PERSONA_PROMPT, wrapped)
+        self.assertIn(CUSTOM_PERSONA_PROMPT, wrapped)
         self.assertIn("下面是NN在这个新线程里发来的第一条消息", wrapped)
         self.assertTrue(wrapped.endswith(prompt))
 
@@ -90,8 +93,16 @@ class TelegramNewThreadPersonaTests(unittest.TestCase):
 
         self.assertEqual(wrapped, prompt)
 
+    def test_blank_persona_prompt_keeps_new_thread_prompt_plain(self) -> None:
+        service = self.build_service("new_thread_blank")
+        prompt = "当前时间：2026-03-30 21:10 (Asia/Tokyo)\nNN说：晚饭吃晚了"
+
+        wrapped = service._decorate_new_thread_prompt(prompt, active_id=None)
+
+        self.assertEqual(wrapped, prompt)
+
     def test_disabled_persona_keeps_new_thread_prompt_plain(self) -> None:
-        service = self.build_service("new_thread_disabled", enabled=False)
+        service = self.build_service("new_thread_disabled", enabled=False, persona_prompt=CUSTOM_PERSONA_PROMPT)
         prompt = "当前时间：2026-03-30 21:10 (Asia/Tokyo)\nNN说：晚饭吃晚了"
 
         wrapped = service._decorate_new_thread_prompt(prompt, active_id=None)
@@ -99,12 +110,11 @@ class TelegramNewThreadPersonaTests(unittest.TestCase):
         self.assertEqual(wrapped, prompt)
 
     def test_custom_persona_prompt_can_override_default(self) -> None:
-        service = self.build_service("new_thread_custom", persona_prompt="CUSTOM PERSONA")
+        service = self.build_service("new_thread_custom", persona_prompt=CUSTOM_PERSONA_PROMPT)
 
         wrapped = service._decorate_new_thread_prompt("hello", active_id=None)
 
-        self.assertIn("CUSTOM PERSONA", wrapped)
-        self.assertNotIn(NEW_THREAD_PERSONA_PROMPT, wrapped)
+        self.assertIn(CUSTOM_PERSONA_PROMPT, wrapped)
 
 
 if __name__ == "__main__":

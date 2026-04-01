@@ -38,6 +38,9 @@ export TG_STREAM_ENABLED=1                             # 可选，默认 1，启
 export TG_STREAM_EDIT_INTERVAL_MS=300                 # 可选，流式编辑节流间隔（毫秒）
 export TG_STREAM_MIN_DELTA_CHARS=8                    # 可选，最小增量字符数，小于该值可能跳过刷新
 export TG_THINKING_STATUS_INTERVAL_MS=700             # 可选，思考状态刷新间隔（毫秒）
+export TG_MEMORY_PATH="./bot_memory.json"             # 可选，Telegram 记忆文件路径
+export TG_MEMORY_AUTO_ENABLED=1                       # 可选，默认 1；只有配置本地记忆写回提示词时才会真的自动写回
+export TG_USER_DISPLAY_NAME="friend"                  # 可选，默认 "对方"，供本地提示词模板引用
 export TG_VOICE_TRANSCRIBE_ENABLED=1                  # 可选；不设置时 run.sh 会在本地环境就绪时自动启用
 export TG_VOICE_TRANSCRIBE_BACKEND="local-whisper"    # 可选，默认 local-whisper
 export TG_VOICE_MAX_BYTES=26214400                    # 可选，允许转写的 Telegram 音频最大字节数
@@ -75,6 +78,13 @@ export CODEX_SANDBOX_MODE=""                         # 可选：仅 CODEX_DANGER
 export CODEX_APPROVAL_POLICY=""                      # 可选：仅 CODEX_DANGEROUS_BYPASS=1 时生效
 export CODEX_DANGEROUS_BYPASS=0                      # 0/1/2（见下方权限说明）
 export CODEX_IDLE_TIMEOUT_SEC=3600                  # 可选：单次 codex exec 连续无输出超时秒数，0 表示禁用
+export TG_NEW_THREAD_PERSONA_PROMPT_PATH="./.local-prompts/new-thread-persona.txt"
+export TG_HEARTBEAT_SESSION_PROMPT_PATH="./.local-prompts/heartbeat-session.txt"
+export TG_HEARTBEAT_BANNED_PATTERNS_PATH="./.local-prompts/heartbeat-banned-patterns.txt"
+export TG_HEARTBEAT_TEMPLATE_MESSAGES_PATH="./.local-prompts/heartbeat-template-messages.txt"
+export TG_HEARTBEAT_FOLLOWUP_TEMPLATE_MESSAGES_PATH="./.local-prompts/heartbeat-followup-template-messages.txt"
+export TG_MEMORY_CONTEXT_PROMPT_PATH="./.local-prompts/memory-context.txt"
+export TG_MEMORY_WRITEBACK_PROMPT_PATH="./.local-prompts/memory-writeback.txt"
 ```
 
 ### 2) 启动服务
@@ -211,6 +221,24 @@ Telegram 的图片和文件消息会先下载到当前会话工作目录下的 `
 - 图片消息会作为图片附件直接带进 Codex 的初始 prompt
 - 以图片形式发送的 document 也会被当作图片附件处理，所有文件都会保存在本地，方便 Codex 按路径读取
 - caption 会作为补充说明，一起带给 Codex
+
+## Telegram 记忆
+
+Telegram 会把每个用户的记忆单独存到一个 JSON 文件里，不再和运行态状态混在一起。
+
+说明：
+
+- `/memory` 可以查看、添加、搜索、置顶、删除记忆
+- 相关记忆可以在发消息时按需注入到 prompt
+- 回复后也可以后台自动提炼值得长期记住的信息
+- 默认记忆文件路径是 `./bot_memory.json`，可通过 `TG_MEMORY_PATH` 或 `MEMORY_PATH` 覆盖
+- 公开仓库里的记忆提示词默认是空白的；只有你在本地提供私有覆盖文件时，自动注入和自动写回才会真正启用
+
+## 私有提示词覆盖
+
+仓库现在默认不内置新会话人格、heartbeat、记忆注入、记忆写回这些提示词。
+
+如果你有不想公开的人设、heartbeat 风格、记忆整理规则，建议放在 `.local-prompts/` 之类的本地目录里，再用上面的环境变量指过去。仓库自带的 `.gitignore` 已经把这类目录排除了。
 
 提示：
 

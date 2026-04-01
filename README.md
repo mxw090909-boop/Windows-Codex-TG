@@ -40,8 +40,8 @@ export TG_STREAM_EDIT_INTERVAL_MS=300                # optional, stream edit thr
 export TG_STREAM_MIN_DELTA_CHARS=8                    # optional, skip refresh if change is too small
 export TG_THINKING_STATUS_INTERVAL_MS=700             # optional, thinking status refresh interval in ms
 export TG_MEMORY_PATH="./bot_memory.json"             # optional, Telegram memory store path
-export TG_MEMORY_AUTO_ENABLED=1                       # optional, default 1; let the bot save important memories automatically
-export TG_USER_DISPLAY_NAME="friend"                  # optional, default "对方" in generic prompt wrappers
+export TG_MEMORY_AUTO_ENABLED=1                       # optional, default 1; auto writeback only runs when a private writeback prompt is configured
+export TG_USER_DISPLAY_NAME="friend"                  # optional, default "对方" in local prompt wrappers
 export TG_VOICE_TRANSCRIBE_ENABLED=1                  # optional; if unset, run.sh auto-enables when local env is ready
 export TG_VOICE_TRANSCRIBE_BACKEND="local-whisper"    # optional, default local-whisper
 export TG_VOICE_MAX_BYTES=26214400                    # optional, max Telegram audio bytes to transcribe
@@ -83,6 +83,9 @@ export TG_NEW_THREAD_PERSONA_PROMPT_PATH="./.local-prompts/new-thread-persona.tx
 export TG_HEARTBEAT_SESSION_PROMPT_PATH="./.local-prompts/heartbeat-session.txt"
 export TG_HEARTBEAT_BANNED_PATTERNS_PATH="./.local-prompts/heartbeat-banned-patterns.txt"
 export TG_HEARTBEAT_TEMPLATE_MESSAGES_PATH="./.local-prompts/heartbeat-template-messages.txt"
+export TG_HEARTBEAT_FOLLOWUP_TEMPLATE_MESSAGES_PATH="./.local-prompts/heartbeat-followup-template-messages.txt"
+export TG_MEMORY_CONTEXT_PROMPT_PATH="./.local-prompts/memory-context.txt"
+export TG_MEMORY_WRITEBACK_PROMPT_PATH="./.local-prompts/memory-writeback.txt"
 ```
 
 ### 2) Start services
@@ -258,12 +261,13 @@ Notes:
 - After a successful reply, the bot can run a small background Codex pass to extract only durable facts worth remembering
 - `/memory` gives you a manual escape hatch so you can review, pin, delete, or add memories yourself
 - The default file path is `./bot_memory.json`, and you can override it with `TG_MEMORY_PATH` or `MEMORY_PATH`
+- The public repo ships blank memory prompt defaults; automatic prompt injection and writeback stay idle until you provide local override files
 
 ## Private Prompt Overrides
 
-The repository ships generic built-in prompts for new-thread persona and heartbeat behavior.
+The repository now ships blank defaults for new-thread persona, heartbeat, and memory prompt injection/writeback.
 
-If you have private persona text, custom heartbeat style, or project-specific prompt instructions that should not be published, keep them in local files such as `.local-prompts/` and point the environment variables above at those files. The repo `.gitignore` already excludes that directory.
+If you have private persona text, custom heartbeat style, memory prompts, or project-specific prompt instructions that should not be published, keep them in local files such as `.local-prompts/` and point the environment variables above at those files. The repo `.gitignore` already excludes that directory.
 
 Tips:
 

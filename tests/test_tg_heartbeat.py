@@ -6,7 +6,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from codex_common import BotState, MemoryStore, SessionStore
-from tg_codex_bot import HEARTBEAT_SESSION_PROMPT, TgCodexService
+from tg_codex_bot import TgCodexService
+
+
+CUSTOM_HEARTBEAT_PROMPT = "CUSTOM HEARTBEAT"
+CUSTOM_HEARTBEAT_TEMPLATE = "template-heartbeat"
+CUSTOM_HEARTBEAT_FOLLOWUP_TEMPLATE = "followup-heartbeat"
 
 
 def write_session_file(root: Path, session_id: str, cwd: str, title_prompt: str) -> None:
@@ -47,7 +52,7 @@ class FakeCodexRunner:
 
     def run_prompt(self, prompt, cwd, session_id=None, on_update=None, image_paths=None, ephemeral=False):
         self.calls.append((prompt, str(cwd), session_id))
-        if HEARTBEAT_SESSION_PROMPT in prompt and "只输出：SKIP" not in prompt:
+        if CUSTOM_HEARTBEAT_PROMPT in prompt and "只输出：SKIP" not in prompt:
             answer = "heartbeat-answer"
         elif "只输出：SKIP" in prompt:
             answer = self.decision_answer
@@ -90,7 +95,16 @@ class TelegramHeartbeatTests(unittest.TestCase):
         tokyo_tz = timezone(timedelta(hours=9), name="Asia/Tokyo")
         return int(datetime(2026, 3, 30, hour, minute, tzinfo=tokyo_tz).timestamp())
 
-    def build_service(self, root: Path, api: RecordingTelegramAPI, runner: FakeCodexRunner) -> TgCodexService:
+    def build_service(
+        self,
+        root: Path,
+        api: RecordingTelegramAPI,
+        runner: FakeCodexRunner,
+        *,
+        heartbeat_prompt: str = CUSTOM_HEARTBEAT_PROMPT,
+        heartbeat_templates: list[str] | None = None,
+        heartbeat_followup_templates: list[str] | None = None,
+    ) -> TgCodexService:
         return TgCodexService(
             api=api,
             sessions=SessionStore(root / "sessions"),
@@ -105,6 +119,9 @@ class TelegramHeartbeatTests(unittest.TestCase):
             stream_edit_interval_ms=300,
             stream_min_delta_chars=8,
             thinking_status_interval_ms=700,
+            heartbeat_session_prompt=heartbeat_prompt,
+            heartbeat_template_messages=heartbeat_templates,
+            heartbeat_followup_template_messages=heartbeat_followup_templates,
             memory_auto_enabled=False,
         )
 
@@ -139,7 +156,7 @@ class TelegramHeartbeatTests(unittest.TestCase):
             root = Path(tmpdir)
             api = RecordingTelegramAPI()
             runner = FakeCodexRunner()
-            service = self.build_service(root, api, runner)
+            service = self.build_service(root, api, runner, heartbeat_templates=[CUSTOM_HEARTBEAT_TEMPLATE])
             service.state.touch_user(123, 456, at=100)
             service.state.configure_heartbeat(123, enabled=True, interval_sec=60)
 
@@ -149,6 +166,7 @@ class TelegramHeartbeatTests(unittest.TestCase):
             service._run_due_heartbeats_once(now_ts=700)
             self.assertEqual(len(api.sent), 1)
             self.assertIsNone(api.sent[0][2])
+            self.assertEqual(api.sent[0][1], CUSTOM_HEARTBEAT_TEMPLATE)
             self.assertTrue(service.state.get_heartbeat(123).get("last_heartbeat_at"))
             self.assertEqual(runner.calls, [])
 
@@ -200,7 +218,7 @@ class TelegramHeartbeatTests(unittest.TestCase):
 
             self.assertEqual(len(runner.calls), 1)
             prompt, cwd, session_id = runner.calls[0]
-            self.assertIn(HEARTBEAT_SESSION_PROMPT, prompt)
+            self.assertIn(CUSTOM_HEARTBEAT_PROMPT, prompt)
             self.assertIn("请顺着当前会话内容和这个时间点，自然地来碰她一下。", prompt)
             self.assertEqual(cwd, str(root))
             self.assertEqual(session_id, "sess-1")
@@ -251,6 +269,20 @@ class TelegramHeartbeatTests(unittest.TestCase):
 
             self.assertTrue(any("今天在忙什么" in text for _, text, _, _ in api.sent))
             self.assertEqual(service.state.get_heartbeat(123).get("unanswered_count"), 2)
+
+    def test_blank_template_heartbeat_stays_silent_without_active_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            api = RecordingTelegramAPI()
+            runner = FakeCodexRunner()
+            service = self.build_service(root, api, runner, heartbeat_templates=[])
+            service.state.touch_user(123, 456, at=100)
+            service.state.configure_heartbeat(123, enabled=True, interval_sec=60)
+
+            triggered = service._trigger_heartbeat(chat_id=456, user_id=123, force=False)
+
+            self.assertFalse(triggered)
+            self.assertEqual(api.sent, [])
 
 
     def test_conversation_parts_keep_code_block_as_separate_bubble(self) -> None:
