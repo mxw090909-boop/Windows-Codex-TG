@@ -1,0 +1,1184 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+try:
+    import lark_oapi as lark
+except ImportError as err:  # pragma: no cover
+    raise SystemExit(
+        "Missing dependency: lark-oapi\n"
+        "Install with: python3 -m pip install --user lark-oapi"
+    ) from err
+
+from codex_common import (
+    BotState,
+    CodexRunner,
+    RunningPromptRegistry,
+    SessionStore,
+    chunk_text,
+    env,
+    log,
+    parse_dangerous_bypass_level,
+    parse_non_negative_int,
+    resolve_codex_bin,
+)
+
+
+MAX_FEISHU_TEXT = 2000
+
+
+def parse_allowed_open_ids(raw: Optional[str]) -> Optional[Set[str]]:
+    if not raw:
+        return None
+    result: Set[str] = set()
+    for part in raw.split(","):
+        value = part.strip()
+        if value:
+            result.add(value)
+    return result or None
+
+
+def parse_epoch_ms(raw: Any) -> Optional[int]:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        try:
+            value = int(float(text))
+        except ValueError:
+            return None
+    if value <= 0:
+        return None
+    # Some SDK payloads may carry seconds instead of milliseconds.
+    if value < 10_000_000_000:
+        value *= 1000
+    return value
+
+
+def parse_text_content(raw: Optional[str]) -> str:
+    if not raw:
+        return ""
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    text = (parsed.get("text") or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"<at[^>]*>.*?</at>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    return text.strip()
+
+
+def _flatten_post_block(node: Any) -> str:
+    if node is None:
+        return ""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, list):
+        # `post.content` is usually a list of lines, each line is a list of blocks.
+        if not node:
+            return ""
+        if all(isinstance(x, list) for x in node):
+            lines: List[str] = []
+            for line in node:
+                line_text = "".join(_flatten_post_block(part) for part in line).strip()
+                if line_text:
+                    lines.append(line_text)
+            return "\n".join(lines)
+        return "".join(_flatten_post_block(x) for x in node)
+    if isinstance(node, dict):
+        tag = str(node.get("tag") or "").lower()
+        if tag == "text":
+            return str(node.get("text") or "")
+        if tag == "a":
+            return str(node.get("text") or node.get("href") or "")
+        if tag == "at":
+            return str(node.get("user_name") or node.get("name") or "")
+        if tag in ("img", "media"):
+            return "[图片]"
+        # Fallback: flatten any nested values.
+        return "".join(_flatten_post_block(v) for v in node.values())
+    return ""
+
+
+def parse_post_content(raw: Optional[str]) -> str:
+    if not raw:
+        return ""
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+
+    # Different clients may send `post` payloads in different wrappers,
+    # for example:
+    # 1) {"zh_cn": {...}}
+    # 2) {"post": {"zh_cn": {...}}}
+    # 3) {"title": "...", "content": [...]}
+    locale_payload: Dict[str, Any] = {}
+    candidate_roots: List[Dict[str, Any]] = [parsed]
+    nested_post = parsed.get("post")
+    if isinstance(nested_post, dict):
+        candidate_roots.append(nested_post)
+    nested_data = parsed.get("data")
+    if isinstance(nested_data, dict):
+        candidate_roots.append(nested_data)
+
+    for root in candidate_roots:
+        if isinstance(root.get("zh_cn"), dict):
+            locale_payload = root["zh_cn"]
+            break
+        if isinstance(root.get("en_us"), dict):
+            locale_payload = root["en_us"]
+            break
+        if "content" in root or "title" in root:
+            locale_payload = root
+            break
+
+    if not locale_payload:
+        return ""
+
+    title = str(locale_payload.get("title") or "").strip()
+    content_node = locale_payload.get("content")
+    if isinstance(content_node, str):
+        # Some payloads encode `content` as a JSON string.
+        try:
+            content_node = json.loads(content_node)
+        except json.JSONDecodeError:
+            pass
+
+    content_text = _flatten_post_block(content_node).strip()
+    if not content_text:
+        # Fallback for unexpected structures.
+        content_text = _flatten_post_block(locale_payload).strip()
+
+    if title and content_text:
+        return f"{title}\n{content_text}"
+    return title or content_text
+
+
+def parse_incoming_message_content(message_type: str, raw: Optional[str]) -> str:
+    msg_type = (message_type or "").strip().lower()
+    if msg_type == "text":
+        return parse_text_content(raw)
+    if msg_type == "post":
+        return parse_post_content(raw)
+    return ""
+
+
+def adapt_markdown_for_feishu(markdown: str) -> Tuple[str, str]:
+    """Convert common markdown syntax to formats better supported by lark_md."""
+    if not markdown:
+        return "", markdown
+
+    # Some model outputs wrap the whole content in ```markdown ... ```.
+    # Unwrap it first so headings/lists can be rendered as markdown instead of code.
+    wrapped = markdown.strip()
+    m = re.match(r"^```(?:markdown|md)?\s*\n([\s\S]*?)\n```$", wrapped, flags=re.IGNORECASE)
+    if m:
+        markdown = m.group(1).strip()
+
+    lines = markdown.splitlines()
+    in_code_block = False
+    title = ""
+    title_found = False
+    out: List[str] = []
+
+    for raw in lines:
+        line = raw.rstrip("\n")
+        striped = line.strip()
+        fence = re.match(r"^```[A-Za-z0-9_+-]*\s*$", striped)
+        if fence:
+            # lark_md is more stable with plain ``` fences than language-tag fences.
+            in_code_block = not in_code_block
+            out.append("```")
+            continue
+        if in_code_block:
+            out.append(line)
+            continue
+
+        m = re.match(r"^(#{1,6})\s+(.*)$", striped)
+        if m:
+            heading_text = m.group(2).strip()
+            if heading_text:
+                if not title_found and len(m.group(1)) == 1:
+                    title = heading_text[:80]
+                    title_found = True
+                out.append(f"**{heading_text}**")
+            continue
+
+        out.append(line)
+
+    body = "\n".join(out).strip()
+    return title, body or markdown
+
+
+class FeishuAPI:
+    def __init__(
+        self,
+        app_id: str,
+        app_secret: str,
+        log_level: str = "INFO",
+        rich_message_enabled: bool = True,
+    ):
+        level = getattr(lark.LogLevel, log_level.upper(), lark.LogLevel.INFO)
+        self.client = (
+            lark.Client.builder()
+            .app_id(app_id)
+            .app_secret(app_secret)
+            .log_level(level)
+            .build()
+        )
+        self.level = level
+        self.rich_message_enabled = rich_message_enabled
+
+    def send_message(self, chat_id: str, text: str) -> bool:
+        ok = True
+        for part in chunk_text(text, size=min(1800, MAX_FEISHU_TEXT)):
+            sent = self._send_text(receive_id_type="chat_id", receive_id=chat_id, text=part)
+            ok = ok and sent
+        return ok
+
+    def send_agent_message(self, chat_id: str, text: str, title: str = "") -> bool:
+        if not self.rich_message_enabled:
+            return self.send_message(chat_id, text)
+        adapted_title, adapted_text = adapt_markdown_for_feishu(text)
+        final_title = adapted_title or title
+        parts = chunk_text(adapted_text, size=3200)
+        total = len(parts)
+        ok = True
+        for i, part in enumerate(parts, start=1):
+            chunk_title = final_title if total == 1 else (
+                f"{final_title} ({i}/{total})" if final_title else ""
+            )
+            sent = self._send_interactive_markdown(
+                receive_id_type="chat_id",
+                receive_id=chat_id,
+                title=chunk_title,
+                markdown=part,
+            )
+            ok = ok and sent
+        return ok
+
+    def send_agent_message_with_id(self, chat_id: str, text: str, title: str = "") -> Optional[str]:
+        """Send one interactive markdown message and return created message_id."""
+        if not self.rich_message_enabled:
+            return None
+        adapted_title, adapted_text = adapt_markdown_for_feishu(text)
+        final_title = adapted_title or title
+        first = chunk_text(adapted_text, size=3200)[0]
+        return self._create_interactive_markdown(
+            receive_id_type="chat_id",
+            receive_id=chat_id,
+            title=final_title,
+            markdown=first,
+        )
+
+    def patch_agent_message(self, message_id: str, text: str, title: str = "") -> bool:
+        if not self.rich_message_enabled:
+            return False
+        adapted_title, adapted_text = adapt_markdown_for_feishu(text)
+        final_title = adapted_title or title
+        first = chunk_text(adapted_text, size=3200)[0]
+        return self._patch_interactive_markdown(
+            message_id=message_id,
+            title=final_title,
+            markdown=first,
+        )
+
+    def send_message_to_open_id(self, open_id: str, text: str) -> bool:
+        ok = True
+        for part in chunk_text(text, size=min(1800, MAX_FEISHU_TEXT)):
+            sent = self._send_text(receive_id_type="open_id", receive_id=open_id, text=part)
+            ok = ok and sent
+        return ok
+
+    def _send_text(self, receive_id_type: str, receive_id: str, text: str) -> bool:
+        request = (
+            lark.im.v1.CreateMessageRequest.builder()
+            .receive_id_type(receive_id_type)
+            .request_body(
+                lark.im.v1.CreateMessageRequestBody.builder()
+                .receive_id(receive_id)
+                .msg_type("text")
+                .content(json.dumps({"text": text}, ensure_ascii=False))
+                .build()
+            )
+            .build()
+        )
+        response = self.client.im.v1.message.create(request)
+        if response.success():
+            return True
+        log(
+            "send failed: "
+            f"code={response.code} msg={response.msg} "
+            f"log_id={response.get_log_id()} receive_id_type={receive_id_type}"
+        )
+        return False
+
+    def _send_interactive_markdown(
+        self,
+        receive_id_type: str,
+        receive_id: str,
+        title: str,
+        markdown: str,
+    ) -> bool:
+        created_id = self._create_interactive_markdown(
+            receive_id_type=receive_id_type,
+            receive_id=receive_id,
+            title=title,
+            markdown=markdown,
+        )
+        return created_id is not None
+
+    @staticmethod
+    def _build_interactive_card_content(title: str, markdown: str) -> str:
+        card = {
+            "config": {"wide_screen_mode": True},
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {"tag": "lark_md", "content": markdown},
+                }
+            ],
+        }
+        if title:
+            card["header"] = {
+                "template": "blue",
+                "title": {"tag": "plain_text", "content": title},
+            }
+        return json.dumps(card, ensure_ascii=False)
+
+    def _create_interactive_markdown(
+        self,
+        receive_id_type: str,
+        receive_id: str,
+        title: str,
+        markdown: str,
+    ) -> Optional[str]:
+        content = self._build_interactive_card_content(title, markdown)
+        request = (
+            lark.im.v1.CreateMessageRequest.builder()
+            .receive_id_type(receive_id_type)
+            .request_body(
+                lark.im.v1.CreateMessageRequestBody.builder()
+                .receive_id(receive_id)
+                .msg_type("interactive")
+                .content(content)
+                .build()
+            )
+            .build()
+        )
+        response = self.client.im.v1.message.create(request)
+        if response.success():
+            data = getattr(response, "data", None)
+            message_id = ""
+            if data is not None:
+                message_id = str(getattr(data, "message_id", "") or "").strip()
+            return message_id
+        log(
+            "send failed: "
+            f"code={response.code} msg={response.msg} "
+            f"log_id={response.get_log_id()} receive_id_type={receive_id_type} "
+            "msg_type=interactive"
+        )
+        return None
+
+    def _patch_interactive_markdown(
+        self,
+        message_id: str,
+        title: str,
+        markdown: str,
+    ) -> bool:
+        if not message_id:
+            return False
+        content = self._build_interactive_card_content(title, markdown)
+        request = (
+            lark.im.v1.PatchMessageRequest.builder()
+            .message_id(message_id)
+            .request_body(
+                lark.im.v1.PatchMessageRequestBody.builder()
+                .content(content)
+                .build()
+            )
+            .build()
+        )
+        response = self.client.im.v1.message.patch(request)
+        if response.success():
+            return True
+        log(
+            "patch failed: "
+            f"code={response.code} msg={response.msg} "
+            f"log_id={response.get_log_id()} message_id={message_id}"
+        )
+        return False
+
+
+class FeishuCodexService:
+    def __init__(
+        self,
+        api: FeishuAPI,
+        sessions: SessionStore,
+        state: BotState,
+        codex: CodexRunner,
+        default_cwd: Path,
+        app_id: str,
+        app_secret: str,
+        allowed_open_ids: Optional[Set[str]],
+        enable_p2p: bool,
+        ignore_old_message_seconds: int,
+        stream_enabled: bool,
+        stream_edit_interval_ms: int,
+        stream_min_delta_chars: int,
+        thinking_status_interval_ms: int,
+    ):
+        self.api = api
+        self.sessions = sessions
+        self.state = state
+        self.codex = codex
+        self.default_cwd = default_cwd
+        self.allowed_open_ids = allowed_open_ids
+        self.enable_p2p = enable_p2p
+        self.ignore_old_message_seconds = max(0, ignore_old_message_seconds)
+        self.stream_enabled = stream_enabled
+        self.stream_edit_interval_ms = max(250, stream_edit_interval_ms)
+        self.stream_min_delta_chars = max(1, stream_min_delta_chars)
+        self.thinking_status_interval_ms = max(500, thinking_status_interval_ms)
+        self.running_prompts = RunningPromptRegistry()
+        self.startup_time_ms = int(time.time() * 1000)
+        self.seen_event_ids: Set[str] = set()
+        self.seen_message_ids: Set[str] = set()
+        self.event_handler = (
+            lark.EventDispatcherHandler.builder("", "", api.level)
+            .register_p2_im_message_receive_v1(self._on_message_receive)
+            .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(self._on_ignored_event)
+            .register_p2_im_chat_member_bot_added_v1(self._on_ignored_event)
+            .register_p2_im_chat_member_bot_deleted_v1(self._on_ignored_event)
+            .register_p2_customized_event("im.message.message_read_v1", self._on_custom_ignored_event)
+            .build()
+        )
+        self.ws_client = lark.ws.Client(
+            app_id,
+            app_secret,
+            log_level=api.level,
+            event_handler=self.event_handler,
+        )
+
+    def run_forever(self) -> None:
+        log(
+            "feishu long connection service started "
+            f"(ignore_old_message_seconds={self.ignore_old_message_seconds}, "
+            f"stream_enabled={self.stream_enabled}, "
+            f"stream_edit_interval_ms={self.stream_edit_interval_ms}, "
+            f"stream_min_delta_chars={self.stream_min_delta_chars}, "
+            f"thinking_status_interval_ms={self.thinking_status_interval_ms})"
+        )
+        self.ws_client.start()
+
+    def _on_ignored_event(self, data: Any) -> None:
+        header = getattr(data, "header", None)
+        event_type = getattr(header, "event_type", "unknown")
+        event_id = getattr(header, "event_id", "")
+        log(f"event ignored: {event_type} id={event_id}")
+
+    def _on_custom_ignored_event(self, data: Any) -> None:
+        header = getattr(data, "header", None)
+        event_type = getattr(header, "event_type", "unknown")
+        event_id = getattr(header, "event_id", "")
+        log(f"event ignored(custom): {event_type} id={event_id}")
+
+    def _on_message_receive(self, data: lark.im.v1.P2ImMessageReceiveV1) -> None:
+        header = data.header
+        event_id = getattr(header, "event_id", "")
+        if event_id:
+            if event_id in self.seen_event_ids:
+                return
+            self.seen_event_ids.add(event_id)
+            if len(self.seen_event_ids) > 5000:
+                self.seen_event_ids.clear()
+
+        event = data.event
+        if not event or not event.message:
+            return
+        msg = event.message
+        msg_type = (msg.message_type or "").strip().lower()
+        if msg_type not in ("text", "post"):
+            log(f"unsupported message type ignored: message_type={msg_type or 'unknown'}")
+            return
+        message_id = (msg.message_id or "").strip()
+        message_create_time = parse_epoch_ms(getattr(msg, "create_time", None))
+        if message_id:
+            if message_id in self.seen_message_ids:
+                log(f"duplicate message dropped: message_id={message_id}")
+                return
+            self.seen_message_ids.add(message_id)
+            if len(self.seen_message_ids) > 10000:
+                self.seen_message_ids.clear()
+
+        sender = event.sender
+        if sender and sender.sender_type == "app":
+            return
+
+        sender_open_id = ""
+        sender_user_id = ""
+        if sender and sender.sender_id:
+            sender_open_id = (sender.sender_id.open_id or "").strip()
+            sender_user_id = (sender.sender_id.user_id or "").strip()
+        actor_id = sender_open_id or sender_user_id
+        if not actor_id:
+            return
+
+        chat_id = (msg.chat_id or "").strip()
+        chat_type = (msg.chat_type or "").strip().lower()
+        if not chat_id:
+            return
+
+        if self.ignore_old_message_seconds > 0 and message_create_time is not None:
+            threshold_ms = self.startup_time_ms - self.ignore_old_message_seconds * 1000
+            if message_create_time < threshold_ms:
+                log(
+                    "stale message ignored: "
+                    f"actor={actor_id} chat_id={chat_id} chat_type={chat_type} "
+                    f"message_id={message_id or '-'} create_time={message_create_time}"
+                )
+                return
+
+        if self.allowed_open_ids is not None and sender_open_id not in self.allowed_open_ids:
+            self.api.send_message(chat_id, "没有权限使用这个 bot。")
+            return
+
+        text = parse_incoming_message_content(msg_type, msg.content)
+        if not text:
+            log(f"empty content ignored: message_type={msg_type} message_id={message_id}")
+            return
+
+        if chat_type == "p2p" and not self.enable_p2p:
+            self.api.send_message(chat_id, "当前未启用私聊，请在群里 @机器人 使用。")
+            return
+
+        log(
+            "message received: "
+            f"actor={actor_id} chat_id={chat_id} chat_type={chat_type} "
+            f"message_id={message_id or '-'} create_time={message_create_time or '-'} "
+            f"text={text[:80]!r}"
+        )
+        self._handle_text(chat_id, actor_id, text)
+
+    def _handle_text(self, chat_id: str, actor_id: str, text: str) -> None:
+        if not text.startswith("/"):
+            if self._try_handle_quick_session_pick(chat_id, actor_id, text):
+                return
+            self.state.set_pending_session_pick(actor_id, False)
+            self._run_prompt(chat_id, actor_id, text)
+            return
+
+        cmd, arg = self._parse_command(text)
+        if cmd in ("start", "help"):
+            self._send_help(chat_id)
+            return
+        if cmd == "sessions":
+            self._handle_sessions(chat_id, actor_id, arg)
+            return
+        if cmd == "use":
+            self._handle_use(chat_id, actor_id, arg)
+            return
+        if cmd == "status":
+            self._handle_status(chat_id, actor_id)
+            return
+        if cmd == "new":
+            self._handle_new(chat_id, actor_id, arg)
+            return
+        if cmd == "history":
+            self._handle_history(chat_id, actor_id, arg)
+            return
+        if cmd == "ask":
+            self._handle_ask(chat_id, actor_id, arg)
+            return
+        self.api.send_message(chat_id, f"未知命令: /{cmd}\n发送 /help 查看说明。")
+
+    @staticmethod
+    def _parse_command(text: str) -> Tuple[str, str]:
+        parts = text.split(" ", 1)
+        cmd = parts[0][1:]
+        cmd = cmd.split("@", 1)[0].strip().lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        return cmd, arg
+
+    def _send_help(self, chat_id: str) -> None:
+        self.api.send_message(
+            chat_id,
+            "\n".join(
+                [
+                    "可用命令:",
+                    "/sessions [N] - 查看最近 N 条会话（标题 + 编号）",
+                    "/use <编号|session_id> - 切换当前会话",
+                    "/history [编号|session_id] [N] - 查看会话最近 N 条消息",
+                    "/new [cwd] - 进入新会话模式（下一条普通消息会新建 session）",
+                    "/status - 查看当前绑定会话",
+                    "/ask <内容> - 手动提问（可选）",
+                    "执行 /sessions 后，可直接发送编号切换会话",
+                    "后台执行时仍可发送 /use /sessions /status",
+                    "直接发普通消息即可对话（会自动续聊当前 session）",
+                ]
+            ),
+        )
+
+    def _handle_sessions(self, chat_id: str, actor_id: str, arg: str) -> None:
+        limit = 10
+        if arg:
+            try:
+                limit = max(1, min(30, int(arg)))
+            except ValueError:
+                self.api.send_message(chat_id, "参数错误，示例: /sessions 10")
+                return
+        items = self.sessions.list_recent(limit=limit)
+        if not items:
+            self.api.send_message(chat_id, "未找到本地会话记录。")
+            return
+        lines = ["最近会话（用 /use 编号 切换）:"]
+        session_ids = [s.session_id for s in items]
+        for i, s in enumerate(items, start=1):
+            short_id = s.session_id[:8]
+            cwd_name = Path(s.cwd).name or s.cwd
+            lines.append(f"{i}. {s.title} | {short_id} | {cwd_name}")
+        lines.append("直接发送编号即可切换（例如发送: 1）")
+        self.api.send_message(chat_id, "\n".join(lines))
+        self.state.set_last_session_ids(actor_id, session_ids)
+        self.state.set_pending_session_pick(actor_id, True)
+
+    def _handle_use(self, chat_id: str, actor_id: str, arg: str) -> None:
+        selector = arg.strip()
+        if not selector:
+            self.api.send_message(chat_id, "示例: /use 1 或 /use <session_id>")
+            return
+        session_id, err = self._resolve_session_selector(actor_id, selector)
+        if err:
+            self.api.send_message(chat_id, err)
+            return
+        if not session_id:
+            self.api.send_message(chat_id, "无效的会话选择参数。")
+            return
+        self._switch_to_session(chat_id, actor_id, session_id)
+
+    def _switch_to_session(self, chat_id: str, actor_id: str, session_id: str) -> None:
+        meta = self.sessions.find_by_id(session_id)
+        if not meta:
+            self.api.send_message(chat_id, f"未找到 session: {session_id}")
+            return
+        self.state.set_active_session(actor_id, meta.session_id, meta.cwd)
+        self.state.set_pending_session_pick(actor_id, False)
+        self.api.send_message(
+            chat_id,
+            f"已切换到:\n{meta.title}\nsession: {meta.session_id}\ncwd: {meta.cwd}\n现在可直接发消息对话。",
+        )
+
+    def _try_handle_quick_session_pick(self, chat_id: str, actor_id: str, text: str) -> bool:
+        if not self.state.is_pending_session_pick(actor_id):
+            return False
+        raw = text.strip()
+        if not raw.isdigit():
+            return False
+        idx = int(raw)
+        recent_ids = self.state.get_last_session_ids(actor_id)
+        if idx <= 0 or idx > len(recent_ids):
+            self.api.send_message(chat_id, "编号无效。请发送 /sessions 重新查看列表。")
+            return True
+        self._switch_to_session(chat_id, actor_id, recent_ids[idx - 1])
+        return True
+
+    def _handle_history(self, chat_id: str, actor_id: str, arg: str) -> None:
+        tokens = [x for x in arg.split() if x]
+        limit = 10
+        session_id: Optional[str] = None
+
+        if not tokens:
+            session_id, _ = self.state.get_active(actor_id)
+            if not session_id:
+                self.api.send_message(
+                    chat_id,
+                    "当前无 active session。先 /use 选择会话，或直接对话后再查看历史。",
+                )
+                return
+        else:
+            session_id, err = self._resolve_session_selector(actor_id, tokens[0])
+            if err:
+                self.api.send_message(chat_id, err)
+                return
+            if not session_id:
+                self.api.send_message(chat_id, "无效的会话选择参数。")
+                return
+            if len(tokens) >= 2:
+                try:
+                    limit = int(tokens[1])
+                except ValueError:
+                    self.api.send_message(chat_id, "N 必须是数字，示例: /history 1 20")
+                    return
+
+        limit = max(1, min(50, limit))
+        meta, messages = self.sessions.get_history(session_id, limit=limit)
+        if not meta:
+            self.api.send_message(chat_id, f"未找到 session: {session_id}")
+            return
+        if not messages:
+            self.api.send_message(chat_id, "该会话暂无可展示历史消息。")
+            return
+
+        lines = [
+            f"会话历史: {meta.title}",
+            f"session: {meta.session_id}",
+            f"显示最近 {len(messages)} 条消息:",
+        ]
+        for i, (role, message) in enumerate(messages, start=1):
+            role_zh = "用户" if role == "user" else "助手"
+            lines.append(f"{i}. [{role_zh}] {SessionStore.compact_message(message)}")
+        self.api.send_message(chat_id, "\n".join(lines))
+
+    def _resolve_session_selector(self, actor_id: str, selector: str) -> Tuple[Optional[str], Optional[str]]:
+        raw = selector.strip()
+        if not raw:
+            return None, "示例: /use 1 或 /use <session_id>"
+        if raw.isdigit():
+            idx = int(raw)
+            recent_ids = self.state.get_last_session_ids(actor_id)
+            if idx <= 0 or idx > len(recent_ids):
+                return None, "编号无效。先执行 /sessions，再用编号。"
+            return recent_ids[idx - 1], None
+        return raw, None
+
+    def _handle_status(self, chat_id: str, actor_id: str) -> None:
+        session_id, cwd = self.state.get_active(actor_id)
+        running_count = self.running_prompts.count(actor_id)
+        if not session_id:
+            message = "当前没有绑定会话。可先 /sessions + /use，或 /new 后直接发消息。"
+            if running_count > 0:
+                message += f"\n后台仍有 {running_count} 个任务运行，可继续 /use 切线程。"
+            self.api.send_message(
+                chat_id,
+                message,
+            )
+            return
+        title = f"session {session_id[:8]}"
+        meta = self.sessions.find_by_id(session_id)
+        if meta:
+            title = meta.title
+        lines = [
+            "当前会话:",
+            title,
+            f"session: {session_id}",
+            f"cwd: {cwd or str(self.default_cwd)}",
+            "支持与本地 Codex 客户端交替续聊。",
+        ]
+        if running_count > 0:
+            lines.append(f"后台运行中: {running_count} 个任务（可继续 /use 切线程）")
+        self.api.send_message(
+            chat_id,
+            "\n".join(lines),
+        )
+
+    def _handle_ask(self, chat_id: str, actor_id: str, arg: str) -> None:
+        prompt = arg.strip()
+        if not prompt:
+            self.api.send_message(chat_id, "示例: /ask 帮我总结当前仓库结构")
+            return
+        self._run_prompt(chat_id, actor_id, prompt)
+
+    def _handle_new(self, chat_id: str, actor_id: str, arg: str) -> None:
+        cwd_raw = arg.strip()
+        _, current_cwd = self.state.get_active(actor_id)
+        target_cwd = Path(current_cwd).expanduser() if current_cwd else self.default_cwd
+        if cwd_raw:
+            candidate = Path(cwd_raw).expanduser()
+            if not candidate.exists() or not candidate.is_dir():
+                self.api.send_message(chat_id, f"cwd 不存在或不是目录: {candidate}")
+                return
+            target_cwd = candidate
+        self.state.clear_active_session(actor_id, str(target_cwd))
+        self.state.set_pending_session_pick(actor_id, False)
+        self.api.send_message(
+            chat_id,
+            f"已进入新会话模式，cwd: {target_cwd}\n下一条普通消息会创建一个新 session。",
+        )
+
+    def _session_label(self, session_id: Optional[str], cwd: Path) -> str:
+        resolved_cwd = cwd
+        if session_id:
+            meta = self.sessions.find_by_id(session_id)
+            title = meta.title if meta else f"session {session_id[:8]}"
+            if meta and meta.cwd:
+                resolved_cwd = Path(meta.cwd)
+        else:
+            title = "新会话"
+        cwd_name = resolved_cwd.name or str(resolved_cwd)
+        if session_id:
+            return f"{title} | {session_id[:8]} | {cwd_name}"
+        return f"{title} | {cwd_name}"
+
+    def _initial_prompt_status(self, session_label: str, active_id: Optional[str], elapsed: Optional[int] = None) -> str:
+        body = "思考中..."
+        if elapsed is not None:
+            body = f"{body}\n\n已等待 {elapsed}s"
+        return self._format_prompt_response(session_label, body)
+
+    @staticmethod
+    def _format_prompt_response(session_label: str, text: str) -> str:
+        return (text or "Codex 没有返回可展示内容。").strip() or "Codex 没有返回可展示内容。"
+
+    @staticmethod
+    def _stream_preview_text(text: str) -> str:
+        raw = text.strip() or "..."
+        suffix = "\n\n[生成中...]"
+        max_size = 3000
+        if len(raw) + len(suffix) <= max_size:
+            return raw + suffix
+        keep = max_size - len(suffix) - 1
+        if keep <= 0:
+            return raw[:max_size]
+        return raw[:keep] + "…" + suffix
+
+    def _finalize_stream_reply(
+        self,
+        chat_id: str,
+        stream_message_id: Optional[str],
+        text: str,
+        progressive_replay: bool = False,
+    ) -> None:
+        if not stream_message_id:
+            self.api.send_agent_message(chat_id, text)
+            return
+
+        adapted_title, adapted_text = adapt_markdown_for_feishu(text)
+        parts = chunk_text(adapted_text or text or "Codex 没有返回可展示内容。", size=3200)
+        if not parts:
+            parts = ["Codex 没有返回可展示内容。"]
+        total = len(parts)
+
+        first_title = adapted_title if total == 1 else (f"{adapted_title} (1/{total})" if adapted_title else "")
+        first_part = parts[0]
+        patched = self.api.patch_agent_message(stream_message_id, first_part, title=first_title)
+        if not patched:
+            self.api.send_agent_message(chat_id, text)
+            return
+
+        # Fallback when upstream doesn't emit incremental deltas:
+        # replay the final text progressively to avoid one-shot large render.
+        if progressive_replay and total == 1 and len(first_part) > 240:
+            step = 140
+            interval_sec = 0.16
+            for end in range(step, len(first_part), step):
+                partial = first_part[:end].rstrip()
+                if not partial:
+                    continue
+                preview = f"{partial}\n\n[生成中...]"
+                ok = self.api.patch_agent_message(stream_message_id, preview, title=first_title)
+                if not ok:
+                    break
+                time.sleep(interval_sec)
+            self.api.patch_agent_message(stream_message_id, first_part, title=first_title)
+
+        for i, part in enumerate(parts[1:], start=2):
+            chunk_title = adapted_title if total == 1 else (f"{adapted_title} ({i}/{total})" if adapted_title else "")
+            self.api.send_agent_message(chat_id, part, title=chunk_title)
+
+    def _run_prompt(self, chat_id: str, actor_id: str, prompt: str) -> None:
+        active_id, active_cwd = self.state.get_active(actor_id)
+        cwd = Path(active_cwd).expanduser() if active_cwd else self.default_cwd
+        if not cwd.exists():
+            cwd = self.default_cwd
+        if not self.running_prompts.try_start(actor_id, active_id):
+            busy_session = active_id[:8] if active_id else "当前线程"
+            self.api.send_message(
+                chat_id,
+                f"会话 {busy_session} 已有任务运行中。可先 /use 切到其他线程，或等待当前回复完成。",
+            )
+            return
+
+        session_label = self._session_label(active_id, cwd)
+        mode = "继续当前会话" if active_id else "新建会话"
+        log(f"queue prompt: actor={actor_id} mode={mode} cwd={cwd} session={active_id}")
+        if not self.stream_enabled or not self.api.rich_message_enabled:
+            self.api.send_message(
+                chat_id,
+                "已开始处理。\n可继续发送 /use、/sessions、/status。",
+            )
+
+        worker = threading.Thread(
+            target=self._run_prompt_worker,
+            args=(chat_id, actor_id, prompt, active_id, cwd, session_label),
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except Exception:
+            self.running_prompts.finish(actor_id, active_id)
+            raise
+
+    def _run_prompt_worker(
+        self,
+        chat_id: str,
+        actor_id: str,
+        prompt: str,
+        active_id: Optional[str],
+        cwd: Path,
+        session_label: str,
+    ) -> None:
+        stream_message_id: Optional[str] = None
+        stream_state: Dict[str, Any] = {
+            "last_preview": "",
+            "last_emit_at_ms": 0,
+            "content_updates": 0,
+        }
+        use_stream = self.stream_enabled and self.api.rich_message_enabled
+        stream_lock = threading.Lock()
+        thinking_stop = threading.Event()
+        first_output = threading.Event()
+        thinking_thread: Optional[threading.Thread] = None
+        run_started_at = time.time()
+        first_output_at: List[float] = []
+
+        def patch_stream_message(text: str) -> bool:
+            nonlocal stream_message_id
+            if not stream_message_id:
+                return False
+            with stream_lock:
+                current_id = stream_message_id
+                if not current_id:
+                    return False
+                ok = self.api.patch_agent_message(current_id, text)
+                if not ok:
+                    stream_message_id = None
+                    return False
+            return True
+
+        if use_stream:
+            placeholder_id = self.api.send_agent_message_with_id(
+                chat_id,
+                self._initial_prompt_status(session_label, active_id),
+            )
+            if placeholder_id:
+                stream_message_id = placeholder_id
+            else:
+                use_stream = False
+
+        def thinking_loop() -> None:
+            phases = ["思考中", "思考中.", "思考中..", "思考中..."]
+            start_ts = time.time()
+            i = 0
+            while not thinking_stop.wait(self.thinking_status_interval_ms / 1000.0):
+                if first_output.is_set():
+                    return
+                elapsed = int(time.time() - start_ts)
+                status_text = self._format_prompt_response(
+                    session_label,
+                    f"{phases[i % len(phases)]}\n\n已等待 {elapsed}s",
+                )
+                i += 1
+                if not patch_stream_message(status_text):
+                    return
+
+        if use_stream and stream_message_id:
+            thinking_thread = threading.Thread(target=thinking_loop, daemon=True)
+            thinking_thread.start()
+
+        def on_update(live_text: str) -> None:
+            first_output.set()
+            if not first_output_at:
+                first_output_at.append(time.time())
+            if not use_stream or not stream_message_id:
+                return
+            preview = self._format_prompt_response(
+                session_label,
+                self._stream_preview_text(live_text),
+            )
+            now_ms = int(time.time() * 1000)
+            last_preview = str(stream_state.get("last_preview") or "")
+            last_emit_at_ms = int(stream_state.get("last_emit_at_ms") or 0)
+            if preview == last_preview:
+                return
+            delta_chars = abs(len(preview) - len(last_preview))
+            if now_ms - last_emit_at_ms < self.stream_edit_interval_ms and delta_chars < self.stream_min_delta_chars:
+                return
+            ok = patch_stream_message(preview)
+            if not ok:
+                return
+            stream_state["last_preview"] = preview
+            stream_state["last_emit_at_ms"] = now_ms
+            stream_state["content_updates"] = int(stream_state.get("content_updates") or 0) + 1
+
+        try:
+            thread_id, answer, stderr_text, return_code = self.codex.run_prompt(
+                prompt=prompt,
+                cwd=cwd,
+                session_id=active_id,
+                on_update=on_update if use_stream else None,
+            )
+        except Exception as e:
+            thinking_stop.set()
+            if thinking_thread is not None:
+                thinking_thread.join(timeout=0.3)
+            err_msg = self._format_prompt_response(
+                session_label,
+                f"调用 Codex 时出现异常: {e}",
+            )
+            if use_stream and stream_message_id:
+                self._finalize_stream_reply(chat_id, stream_message_id, err_msg, progressive_replay=False)
+            else:
+                self.api.send_agent_message(chat_id, err_msg)
+            return
+        finally:
+            thinking_stop.set()
+            if thinking_thread is not None:
+                thinking_thread.join(timeout=0.3)
+            self.running_prompts.finish(actor_id, active_id)
+
+        elapsed_sec = round(time.time() - run_started_at, 2)
+        first_output_sec = round(first_output_at[0] - run_started_at, 2) if first_output_at else None
+        log(
+            "prompt finished: "
+            f"actor={actor_id} session={active_id} thread={thread_id} exit={return_code} "
+            f"elapsed_sec={elapsed_sec} first_output_sec={first_output_sec}"
+        )
+
+        final_session_id = thread_id or active_id
+        final_session_label = self._session_label(final_session_id, cwd)
+        session_updated = False
+        if thread_id:
+            session_updated = self.state.update_active_session_if_unchanged(
+                actor_id,
+                active_id,
+                thread_id,
+                str(cwd),
+            )
+
+        if return_code != 0:
+            msg = f"Codex 执行失败 (exit={return_code})\n{answer}"
+            if stderr_text:
+                msg += f"\n\nstderr:\n{stderr_text[-1200:]}"
+            msg = self._format_prompt_response(final_session_label, msg)
+            if use_stream and stream_message_id:
+                self._finalize_stream_reply(chat_id, stream_message_id, msg, progressive_replay=False)
+            else:
+                self.api.send_agent_message(chat_id, msg)
+            return
+
+        if thread_id and not session_updated:
+            current_active_id, _ = self.state.get_active(actor_id)
+            if current_active_id != thread_id:
+                note = "当前活动线程未变；这是后台线程的回复。"
+                if not active_id:
+                    note = "新线程已创建，但你已经切到别的线程，当前活动线程未变。"
+                answer = f"{note}\n\n{answer}"
+
+        answer = self._format_prompt_response(final_session_label, answer)
+        if use_stream and stream_message_id:
+            replay = int(stream_state.get("content_updates") or 0) == 0
+            self._finalize_stream_reply(chat_id, stream_message_id, answer, progressive_replay=replay)
+            return
+
+        self.api.send_agent_message(chat_id, answer)
+
+
+def build_service() -> FeishuCodexService:
+    app_id = env("FEISHU_APP_ID")
+    app_secret = env("FEISHU_APP_SECRET")
+    if not app_id or not app_secret:
+        raise RuntimeError("missing FEISHU_APP_ID or FEISHU_APP_SECRET")
+
+    allowed_open_ids = parse_allowed_open_ids(env("ALLOWED_FEISHU_OPEN_IDS"))
+    session_root = Path(env("CODEX_SESSION_ROOT", "~/.codex/sessions")).expanduser()
+    state_path = Path(env("STATE_PATH", "./feishu_bot_state.json"))
+    codex_bin = resolve_codex_bin(env("CODEX_BIN"))
+    codex_sandbox_mode = env("CODEX_SANDBOX_MODE")
+    codex_approval_policy = env("CODEX_APPROVAL_POLICY")
+    codex_dangerous_bypass_level = parse_dangerous_bypass_level(env("CODEX_DANGEROUS_BYPASS", "0"))
+    codex_idle_timeout_sec = parse_non_negative_int(
+        env("CODEX_IDLE_TIMEOUT_SEC", env("CODEX_EXEC_TIMEOUT_SEC", "3600")),
+        3600,
+    )
+    default_cwd = Path(env("DEFAULT_CWD", os.getcwd())).expanduser()
+    enable_p2p = env("FEISHU_ENABLE_P2P", "0") == "1"
+    log_level = env("FEISHU_LOG_LEVEL", "INFO") or "INFO"
+    rich_message_enabled = env("FEISHU_RICH_MESSAGE", "1") == "1"
+    stream_enabled = env("FEISHU_STREAM_ENABLED", "1") == "1"
+    stream_edit_interval_ms = parse_non_negative_int(
+        env("FEISHU_STREAM_EDIT_INTERVAL_MS", "400"),
+        400,
+    )
+    stream_min_delta_chars = parse_non_negative_int(
+        env("FEISHU_STREAM_MIN_DELTA_CHARS", "12"),
+        12,
+    )
+    thinking_status_interval_ms = parse_non_negative_int(
+        env("FEISHU_THINKING_STATUS_INTERVAL_MS", "900"),
+        900,
+    )
+    ignore_old_message_seconds = parse_non_negative_int(
+        env("FEISHU_IGNORE_OLD_MESSAGE_SECONDS", "180"),
+        180,
+    )
+
+    api = FeishuAPI(
+        app_id=app_id,
+        app_secret=app_secret,
+        log_level=log_level,
+        rich_message_enabled=rich_message_enabled,
+    )
+    sessions = SessionStore(session_root)
+    state = BotState(state_path)
+    codex = CodexRunner(
+        codex_bin=codex_bin,
+        sandbox_mode=codex_sandbox_mode,
+        approval_policy=codex_approval_policy,
+        dangerous_bypass_level=codex_dangerous_bypass_level,
+        idle_timeout_sec=codex_idle_timeout_sec,
+    )
+    if codex_dangerous_bypass_level == 1:
+        log("[warn] CODEX_DANGEROUS_BYPASS=1, enabling sandbox_mode=danger-full-access and approval_policy=never")
+    elif codex_dangerous_bypass_level >= 2:
+        log("[warn] CODEX_DANGEROUS_BYPASS=2, approvals and sandbox are fully bypassed")
+    if codex_idle_timeout_sec > 0:
+        log(f"[info] Codex idle timeout enabled ({codex_idle_timeout_sec}s)")
+    else:
+        log("[warn] Codex idle timeout disabled")
+
+    return FeishuCodexService(
+        api=api,
+        sessions=sessions,
+        state=state,
+        codex=codex,
+        default_cwd=default_cwd,
+        app_id=app_id,
+        app_secret=app_secret,
+        allowed_open_ids=allowed_open_ids,
+        enable_p2p=enable_p2p,
+        ignore_old_message_seconds=ignore_old_message_seconds,
+        stream_enabled=stream_enabled,
+        stream_edit_interval_ms=stream_edit_interval_ms,
+        stream_min_delta_chars=stream_min_delta_chars,
+        thinking_status_interval_ms=thinking_status_interval_ms,
+    )
+
+
+def main() -> None:
+    service = build_service()
+    service.run_forever()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception as err:
+        log(f"fatal error: {err}")
+        sys.exit(1)
