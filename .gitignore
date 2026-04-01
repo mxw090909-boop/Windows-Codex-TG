@@ -1,0 +1,6 @@
+run.sh
+.runtime/
+__pycache__/
+telegram.local.env
+.local-prompts/
+.tmp-tests/
