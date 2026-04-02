@@ -7,7 +7,13 @@ import unittest
 from pathlib import Path
 
 from codex_common import BotState, MemoryStore, SessionStore
-from tg_codex_bot import TTS_CALLBACK_PREFIX, TgCodexService
+from tg_codex_bot import (
+    TTS_CALLBACK_PREFIX,
+    TTS_TRIGGER_AUTO,
+    TTS_TRIGGER_ECHO,
+    TTS_TRIGGER_MANUAL,
+    TgCodexService,
+)
 from tg_tts import SynthesizedVoiceNote
 
 
@@ -29,6 +35,7 @@ class FakeTelegramAPI:
         self.voices = []
         self.callback_answers = []
         self.deleted = []
+        self.edits = []
 
     def get_updates(self, offset, timeout=30):
         return []
@@ -41,6 +48,7 @@ class FakeTelegramAPI:
         return {"message_id": len(self.sent)}
 
     def edit_message_text(self, chat_id, message_id, text, reply_markup=None):
+        self.edits.append((chat_id, message_id, text, reply_markup))
         return None
 
     def send_chat_action(self, chat_id, action="typing"):
@@ -98,39 +106,152 @@ class TelegramVoiceReplyTests(unittest.TestCase):
             tts_cache_dir=root / "tts-cache",
         )
 
-    def test_voice_command_saves_key_voice_id_and_frequency(self) -> None:
+    def test_voice_command_saves_key_and_voice_id(self) -> None:
         root = make_test_root("voice_command")
         api = FakeTelegramAPI()
         service = self.build_service(root, api=api)
 
         service._handle_voice(456, 1, 123, "key sk-1234567890abcdef")
         service._handle_voice(456, 1, 123, "voice male-qn-qingse")
-        service._handle_voice(456, 1, 123, "freq high")
         service._handle_voice(456, 1, 123, "")
 
         settings = service.state.get_voice_settings(123)
         self.assertEqual(settings["api_key"], "sk-1234567890abcdef")
         self.assertEqual(settings["voice_id"], "male-qn-qingse")
-        self.assertEqual(settings["frequency"], "high")
         joined = "\n".join(text for _, text, _, _ in api.sent)
         self.assertIn("sk-123...cdef", joined)
         self.assertIn("male-qn-qingse", joined)
-        self.assertIn("频率: 高", joined)
+        self.assertIn("默认走文字", joined)
+        self.assertNotIn("/voice freq", joined)
 
-    def test_offer_conversation_voice_returns_inline_button_when_ready(self) -> None:
-        root = make_test_root("voice_button")
+    def test_resolve_reply_tts_trigger_prefers_manual_request(self) -> None:
+        root = make_test_root("voice_trigger_detect")
         service = self.build_service(root)
         service.state.update_voice_settings(123, api_key="secret-key", voice_id="male-qn-qingse")
 
-        markup = service._maybe_offer_conversation_voice(456, "我现在就陪你说。", user_id=123)
+        manual = service._resolve_reply_tts_trigger(123, "请直接说一遍给我听", source_kind="text")
+        echo = service._resolve_reply_tts_trigger(123, "我刚刚在说话", source_kind="voice")
+        auto = service._resolve_reply_tts_trigger(123, "今天有点困", source_kind="text")
+        manual_over_echo = service._resolve_reply_tts_trigger(123, "说给我听", source_kind="voice")
 
-        self.assertIsNotNone(markup)
-        callback_data = markup["inline_keyboard"][0][0]["callback_data"]
-        self.assertTrue(callback_data.startswith(TTS_CALLBACK_PREFIX))
-        token = callback_data[len(TTS_CALLBACK_PREFIX) :]
-        request = service.state.get_tts_request(123, token)
-        self.assertIsNotNone(request)
-        self.assertEqual(request["text"], "我现在就陪你说。")
+        self.assertEqual(manual, TTS_TRIGGER_MANUAL)
+        self.assertEqual(echo, TTS_TRIGGER_ECHO)
+        self.assertEqual(auto, TTS_TRIGGER_AUTO)
+        self.assertEqual(manual_over_echo, TTS_TRIGGER_MANUAL)
+
+    def test_build_reply_delivery_segments_manual_request_prefers_voice(self) -> None:
+        root = make_test_root("voice_segments_manual")
+        service = self.build_service(root)
+        service.state.update_voice_settings(123, api_key="secret-key", voice_id="male-qn-qingse")
+
+        segments = service._build_reply_delivery_segments(
+            "好的，已经确认了。请直接语音说一遍。",
+            123,
+            trigger_hint=TTS_TRIGGER_MANUAL,
+        )
+
+        self.assertTrue(segments)
+        self.assertTrue(all(is_voice for _, is_voice in segments))
+
+    def test_build_reply_delivery_segments_voice_echo_prefers_voice(self) -> None:
+        root = make_test_root("voice_segments_echo")
+        service = self.build_service(root)
+        service.state.update_voice_settings(123, api_key="secret-key", voice_id="male-qn-qingse")
+
+        segments = service._build_reply_delivery_segments(
+            "收到，我刚听完。等我一下，我整理后说给你听。",
+            123,
+            trigger_hint=TTS_TRIGGER_ECHO,
+        )
+
+        self.assertTrue(segments)
+        self.assertTrue(any(is_voice for _, is_voice in segments))
+
+    def test_build_reply_delivery_segments_auto_keeps_some_text(self) -> None:
+        root = make_test_root("voice_segments_auto")
+        service = self.build_service(root)
+        service.state.update_voice_settings(123, api_key="secret-key", voice_id="male-qn-qingse")
+
+        segments = service._build_reply_delivery_segments(
+            "好的，已经确认了。今天的安排我已经整理好了。",
+            123,
+            trigger_hint=TTS_TRIGGER_AUTO,
+        )
+
+        self.assertEqual(len([1 for _, is_voice in segments if is_voice]), 1)
+        self.assertEqual(len([1 for _, is_voice in segments if not is_voice]), 1)
+
+    def test_build_reply_delivery_segments_auto_respects_cooldown(self) -> None:
+        root = make_test_root("voice_segments_cooldown")
+        service = self.build_service(root)
+        service.state.update_voice_settings(123, api_key="secret-key", voice_id="male-qn-qingse")
+        service.state.record_voice_reply_result(123, used_voice=True, reason="manual")
+
+        segments = service._build_reply_delivery_segments(
+            "好的，已经确认了。请直接语音说一遍。",
+            123,
+            trigger_hint=TTS_TRIGGER_AUTO,
+        )
+
+        self.assertTrue(segments)
+        self.assertTrue(all((not is_voice) for _, is_voice in segments))
+
+    def test_build_reply_delivery_segments_keeps_sentence_boundaries(self) -> None:
+        root = make_test_root("voice_sentence_boundaries")
+        service = self.build_service(root)
+        service.state.update_voice_settings(123, api_key="secret-key", voice_id="male-qn-qingse")
+
+        segments = service._build_reply_delivery_segments(
+            "好的，已经确认了。C:\\repo\\app.py 在这里。稍后同步结果。",
+            123,
+            trigger_hint=TTS_TRIGGER_MANUAL,
+        )
+
+        texts = [text for text, _ in segments]
+        self.assertIn("好的，已经确认了。", texts)
+        self.assertIn("C:\\repo\\app.py 在这里。", texts)
+        self.assertIn("稍后同步结果。", texts)
+
+    def test_send_delivery_segments_records_reply_result(self) -> None:
+        root = make_test_root("voice_reply_history")
+        api = FakeTelegramAPI()
+        service = self.build_service(root, api=api)
+        service.state.update_voice_settings(123, api_key="secret-key", voice_id="male-qn-qingse")
+        service._build_user_tts_synthesizer = lambda user_id, request=None: FakeSynthesizer()
+
+        service._send_delivery_segments(
+            456,
+            88,
+            123,
+            [("好的，已经确认了。", True), ("现在已经没事了。", False)],
+            trigger_hint=TTS_TRIGGER_MANUAL,
+        )
+
+        recent = service.state.get_recent_voice_reply_results(123, limit=1)
+        self.assertEqual(len(api.voices), 1)
+        self.assertEqual(recent[0]["reason"], TTS_TRIGGER_MANUAL)
+        self.assertTrue(recent[0]["used_voice"])
+
+    def test_send_delivery_segments_streamed_text_keeps_conversation_bubbles(self) -> None:
+        root = make_test_root("voice_stream_text_parts")
+        api = FakeTelegramAPI()
+        service = self.build_service(root, api=api)
+        service.state.update_voice_settings(123, api_key="secret-key", voice_id="male-qn-qingse")
+
+        service._send_delivery_segments(
+            456,
+            88,
+            123,
+            [("第一段先发。\n\n第二段补充说明。", False)],
+            trigger_hint=TTS_TRIGGER_AUTO,
+            stream_message_id=77,
+        )
+
+        self.assertEqual(len(api.edits), 1)
+        self.assertEqual(api.edits[0][2], "第一段先发。")
+        self.assertEqual(len(api.sent), 1)
+        self.assertEqual(api.sent[0][1], "第二段补充说明。")
+        self.assertIsNone(api.sent[0][2])
 
     def test_tts_callback_worker_sends_voice(self) -> None:
         root = make_test_root("voice_worker")
@@ -144,81 +265,7 @@ class TelegramVoiceReplyTests(unittest.TestCase):
 
         self.assertEqual(len(api.voices), 1)
         self.assertIsNone(api.voices[0][2])
-        self.assertEqual(api.voices[0][1].audio_bytes, b"voice:\xe4\xbd\xa0\xe5\xa5\xbd\xe5\x91\x80")
-
-    def test_queue_conversation_voice_reply_sends_voice_automatically(self) -> None:
-        root = make_test_root("voice_auto_send")
-        api = FakeTelegramAPI()
-        service = self.build_service(root, api=api)
-        service.state.update_voice_settings(123, api_key="secret-key", voice_id="male-qn-qingse")
-        service._build_user_tts_synthesizer = lambda user_id, request=None: FakeSynthesizer()
-
-        service._queue_conversation_voice_reply(456, "你好呀", reply_to=88, user_id=123)
-
-        deadline = time.time() + 1.0
-        while time.time() < deadline and not api.voices:
-            time.sleep(0.01)
-
-        self.assertEqual(len(api.voices), 1)
-        self.assertIsNone(api.voices[0][2])
-        self.assertEqual(api.voices[0][1].audio_bytes, b"voice:\xe4\xbd\xa0\xe5\xa5\xbd\xe5\x91\x80")
-
-    def test_build_reply_delivery_segments_can_mix_voice_and_text(self) -> None:
-        root = make_test_root("voice_segments_mix")
-        service = self.build_service(root)
-        service.state.update_voice_settings(
-            123,
-            api_key="secret-key",
-            voice_id="male-qn-qingse",
-            frequency="high",
-        )
-
-        segments = service._build_reply_delivery_segments(
-            "过来让我抱一下。C:\\repo\\app.py 在这里。别怕，我在。",
-            123,
-        )
-
-        self.assertGreaterEqual(len(segments), 2)
-        self.assertTrue(any(is_voice for _, is_voice in segments))
-        self.assertTrue(any((not is_voice) for _, is_voice in segments))
-
-    def test_build_reply_delivery_segments_keeps_sentence_boundaries(self) -> None:
-        root = make_test_root("voice_sentence_boundaries")
-        service = self.build_service(root)
-        service.state.update_voice_settings(
-            123,
-            api_key="secret-key",
-            voice_id="male-qn-qingse",
-            frequency="high",
-        )
-
-        segments = service._build_reply_delivery_segments(
-            "过来让我抱一下，别怕，我在。C:\\repo\\app.py 在这里。晚点我再陪你。",
-            123,
-        )
-
-        texts = [text for text, _ in segments]
-        self.assertIn("过来让我抱一下，别怕，我在。", texts)
-        self.assertIn("C:\\repo\\app.py 在这里。", texts)
-        self.assertIn("晚点我再陪你。", texts)
-
-    def test_low_frequency_limits_voice_segments(self) -> None:
-        root = make_test_root("voice_segments_low")
-        service = self.build_service(root)
-        service.state.update_voice_settings(
-            123,
-            api_key="secret-key",
-            voice_id="male-qn-qingse",
-            frequency="low",
-        )
-
-        segments = service._build_reply_delivery_segments(
-            "过来让我抱一下。C:\\repo\\app.py 在这里。别怕，我在。",
-            123,
-        )
-
-        voice_segments = [text for text, is_voice in segments if is_voice]
-        self.assertEqual(len(voice_segments), 1)
+        self.assertEqual(api.voices[0][1].audio_bytes, "voice:你好呀".encode("utf-8"))
 
     def test_callback_query_dispatches_tts_token(self) -> None:
         root = make_test_root("voice_callback_query")
@@ -247,7 +294,7 @@ class TelegramVoiceReplyTests(unittest.TestCase):
 
         self.assertTrue(called.wait(1))
         self.assertEqual(captured, [(456, 77, 123, token)])
-        self.assertEqual(api.callback_answers[0][1], "好，我现在开口。")
+        self.assertEqual(api.callback_answers[0][1], "正在生成语音。")
 
 
 if __name__ == "__main__":

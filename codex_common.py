@@ -730,7 +730,6 @@ class BotState:
         api_key: Any = None,
         voice_id: Any = None,
         model: Any = None,
-        frequency: Any = None,
         clear: bool = False,
     ) -> Dict[str, Any]:
         with self._lock:
@@ -748,7 +747,6 @@ class BotState:
             normalized_api_key = self._normalize_voice_setting(api_key, limit=800)
             normalized_voice_id = self._normalize_voice_setting(voice_id, limit=120)
             normalized_model = self._normalize_voice_setting(model, limit=120)
-            normalized_frequency = self._normalize_voice_setting(frequency, limit=32)
 
             if api_key is not None:
                 if normalized_api_key is None:
@@ -765,15 +763,83 @@ class BotState:
                     voice.pop("model", None)
                 else:
                     voice["model"] = normalized_model
-            if frequency is not None:
-                if normalized_frequency is None:
-                    voice.pop("frequency", None)
-                else:
-                    voice["frequency"] = normalized_frequency
 
             voice["updated_at"] = int(time.time())
             self._save_unlocked()
             return copy.deepcopy(voice)
+
+    def record_voice_reply_result(
+        self,
+        user_id: StateActor,
+        *,
+        used_voice: bool,
+        reason: Optional[str] = None,
+        at: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        timestamp = int(at if at is not None else time.time())
+        normalized_reason = (str(reason or "").strip().lower() or "text-only")[:32]
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            voice = user_data.setdefault("voice", {})
+            if not isinstance(voice, dict):
+                voice = {}
+                user_data["voice"] = voice
+
+            existing = voice.get("recent_reply_results")
+            normalized_items: List[Dict[str, Any]] = []
+            if isinstance(existing, list):
+                for item in existing:
+                    if not isinstance(item, dict):
+                        continue
+                    normalized_items.append(
+                        {
+                            "at": int(item.get("at") or 0),
+                            "used_voice": bool(item.get("used_voice")),
+                            "reason": str(item.get("reason") or "").strip().lower()[:32],
+                        }
+                    )
+
+            normalized_items.append(
+                {
+                    "at": timestamp,
+                    "used_voice": bool(used_voice),
+                    "reason": normalized_reason,
+                }
+            )
+            voice["recent_reply_results"] = normalized_items[-8:]
+            self._save_unlocked()
+            return copy.deepcopy(voice["recent_reply_results"])
+
+    def get_recent_voice_reply_results(
+        self,
+        user_id: StateActor,
+        *,
+        limit: int = 8,
+    ) -> List[Dict[str, Any]]:
+        normalized_limit = max(1, int(limit))
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            voice = user_data.get("voice")
+            if not isinstance(voice, dict):
+                return []
+            existing = voice.get("recent_reply_results")
+            if not isinstance(existing, list):
+                return []
+
+            items: List[Dict[str, Any]] = []
+            for item in reversed(existing):
+                if not isinstance(item, dict):
+                    continue
+                items.append(
+                    {
+                        "at": int(item.get("at") or 0),
+                        "used_voice": bool(item.get("used_voice")),
+                        "reason": str(item.get("reason") or "").strip().lower()[:32],
+                    }
+                )
+                if len(items) >= normalized_limit:
+                    break
+            return items
 
     def create_tts_request(
         self,

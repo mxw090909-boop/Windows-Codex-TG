@@ -24,6 +24,30 @@ DEFAULT_MINIMAX_MODEL = "speech-2.8-turbo"
 DEFAULT_MINIMAX_LANGUAGE_BOOST = "Chinese"
 
 
+def _windows_hidden_subprocess_kwargs() -> Dict[str, Any]:
+    if os.name != "nt":
+        return {}
+
+    kwargs: Dict[str, Any] = {}
+    creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+
+    startupinfo_cls = getattr(subprocess, "STARTUPINFO", None)
+    if startupinfo_cls is None:
+        return kwargs
+
+    try:
+        startupinfo = startupinfo_cls()
+    except Exception:
+        return kwargs
+
+    startupinfo.dwFlags |= int(getattr(subprocess, "STARTF_USESHOWWINDOW", 0) or 0)
+    startupinfo.wShowWindow = int(getattr(subprocess, "SW_HIDE", 0) or 0)
+    kwargs["startupinfo"] = startupinfo
+    return kwargs
+
+
 @dataclass
 class SynthesizedVoiceNote:
     audio_bytes: bytes
@@ -128,7 +152,13 @@ def convert_audio_bytes_to_voice_note(
             "voip",
             output_path,
         ]
-        completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            **_windows_hidden_subprocess_kwargs(),
+        )
         if completed.returncode != 0:
             stderr_tail = (completed.stderr or "").strip()[-1200:]
             raise RuntimeError(f"ffmpeg 转 Telegram 语音失败: {stderr_tail}")

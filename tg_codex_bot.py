@@ -98,16 +98,45 @@ MEMORY_CATEGORY_LABELS = {
     "general": "记忆",
 }
 TTS_CALLBACK_PREFIX = "tts:"
-TTS_BUTTON_TEXT = "听我说"
-TTS_FREQUENCY_DEFAULT = "medium"
-TTS_FREQUENCY_LABELS = {
-    "high": "高",
-    "medium": "中",
-    "low": "低",
-}
+TTS_BUTTON_TEXT = "语音版"
+TTS_TRIGGER_NONE = "none"
+TTS_TRIGGER_MANUAL = "manual"
+TTS_TRIGGER_ECHO = "echo"
+TTS_TRIGGER_AUTO = "auto"
+TTS_AUTO_COOLDOWN_REPLY_WINDOW = 2
+TTS_MANUAL_MAX_SEGMENTS = 2
+TTS_ECHO_MAX_SEGMENTS = 2
+TTS_AUTO_MAX_SEGMENTS = 1
+TTS_MANUAL_MIN_SCORE = 1
+TTS_ECHO_MIN_SCORE = 1
+TTS_AUTO_MIN_SCORE = 4
 NEW_THREAD_PERSONA_PROMPT = ""
 MEMORY_CONTEXT_PROMPT = ""
 MEMORY_WRITEBACK_PROMPT = ""
+
+
+def _windows_hidden_subprocess_kwargs() -> Dict[str, Any]:
+    if os.name != "nt":
+        return {}
+
+    kwargs: Dict[str, Any] = {}
+    creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+
+    startupinfo_cls = getattr(subprocess, "STARTUPINFO", None)
+    if startupinfo_cls is None:
+        return kwargs
+
+    try:
+        startupinfo = startupinfo_cls()
+    except Exception:
+        return kwargs
+
+    startupinfo.dwFlags |= int(getattr(subprocess, "STARTF_USESHOWWINDOW", 0) or 0)
+    startupinfo.wShowWindow = int(getattr(subprocess, "SW_HIDE", 0) or 0)
+    kwargs["startupinfo"] = startupinfo
+    return kwargs
 
 
 def _resolve_local_path(raw_path: Optional[str]) -> Optional[Path]:
@@ -167,28 +196,20 @@ def _load_list_override(default: List[str], *, inline_env_name: str, path_env_na
         return list(default)
 
 
-def _normalize_tts_frequency(value: Any) -> str:
-    raw = str(value or "").strip().lower()
-    mapping = {
-        "high": "high",
-        "h": "high",
-        "高": "high",
-        "medium": "medium",
-        "mid": "medium",
-        "m": "medium",
-        "中": "medium",
-        "normal": "medium",
-        "default": "medium",
-        "low": "low",
-        "l": "low",
-        "低": "low",
-    }
-    return mapping.get(raw, TTS_FREQUENCY_DEFAULT)
+def _looks_like_explicit_tts_request(value: Any) -> bool:
+    cleaned = re.sub(r"\s+", "", str(value or "")).strip().lower()
+    if not cleaned:
+        return False
 
-
-def _is_known_tts_frequency(value: Any) -> bool:
-    raw = str(value or "").strip().lower()
-    return raw in {"high", "h", "高", "medium", "mid", "m", "中", "normal", "default", "low", "l", "低"}
+    patterns = [
+        r"(说|讲|念|读).{0,12}(给我听|让我听)",
+        r"(我想听|想听你)(说话|说|声音)",
+        r"(发|回).{0,8}语音",
+        r"语音.{0,6}(回我|说|讲|念)",
+        r"(用语音|语音版).{0,6}(说|讲|念|读|回复)",
+        r"说点什么给我听",
+    ]
+    return any(re.search(pattern, cleaned, flags=re.IGNORECASE) for pattern in patterns)
 
 
 def _render_prompt_template(template: str, **values: str) -> str:
@@ -702,7 +723,12 @@ class LocalWhisperAudioTranscriber(AudioTranscriber):
             "-",
         ]
         try:
-            out = subprocess.run(cmd, capture_output=True, check=True).stdout
+            out = subprocess.run(
+                cmd,
+                capture_output=True,
+                check=True,
+                **_windows_hidden_subprocess_kwargs(),
+            ).stdout
         except subprocess.CalledProcessError as e:
             detail = e.stderr.decode("utf-8", errors="replace").strip()
             raise RuntimeError(f"ffmpeg 解码失败: {detail}") from e
@@ -993,7 +1019,6 @@ class TgCodexService:
         api_key = str(settings.get("api_key") or "").strip()
         voice_id = str(settings.get("voice_id") or "").strip()
         model = str(settings.get("model") or self.tts_default_model or "").strip()
-        frequency = _normalize_tts_frequency(settings.get("frequency"))
         if self.tts_backend == "disabled":
             return ["语音回复现在还没开。"]
         lines = [
@@ -1001,11 +1026,12 @@ class TgCodexService:
             f"backend: {self.tts_backend}",
             f"API key: {'已设置（' + self._mask_secret(api_key) + '）' if api_key else '未设置'}",
             f"voice_id: {voice_id or '未设置'}",
-            f"频率: {TTS_FREQUENCY_LABELS.get(frequency, '中')}",
+            "触发：默认走文字；你明确要求语音、你先发语音，或者句子更适合口播时才会发语音。",
+            "冷却：最近两条里如果已经发过语音，会先回到文字，避免连续播报。",
         ]
         if model:
             lines.append(f"model: {model}")
-        lines.append("用法：/voice key <API_KEY> | /voice voice <voice_id> | /voice freq <high|medium|low> | /voice clear")
+        lines.append("用法：/voice | /voice key <API_KEY> | /voice voice <voice_id> | /voice clear")
         return lines
 
     def _tts_feature_ready_for_user(self, user_id: int) -> bool:
@@ -1027,11 +1053,53 @@ class TgCodexService:
             max_chars=self.tts_max_chars,
         )
 
-    def _tts_frequency_for_user(self, user_id: Optional[int]) -> str:
+    def _resolve_reply_tts_trigger(
+        self,
+        user_id: Optional[int],
+        user_text: Optional[str],
+        *,
+        source_kind: str = "text",
+    ) -> str:
+        if user_id is None or not self._tts_feature_ready_for_user(int(user_id)):
+            return TTS_TRIGGER_NONE
+        if _looks_like_explicit_tts_request(user_text):
+            return TTS_TRIGGER_MANUAL
+        if (source_kind or "").strip().lower() == "voice":
+            return TTS_TRIGGER_ECHO
+        return TTS_TRIGGER_AUTO
+
+    def _auto_tts_cooldown_active(self, user_id: Optional[int]) -> bool:
         if user_id is None:
-            return TTS_FREQUENCY_DEFAULT
-        settings = self._tts_settings_for_user(int(user_id))
-        return _normalize_tts_frequency(settings.get("frequency"))
+            return False
+        recent = self.state.get_recent_voice_reply_results(
+            int(user_id),
+            limit=TTS_AUTO_COOLDOWN_REPLY_WINDOW,
+        )
+        return any(bool(item.get("used_voice")) for item in recent)
+
+    @staticmethod
+    def _tts_trigger_min_score(trigger_hint: str) -> int:
+        if trigger_hint == TTS_TRIGGER_MANUAL:
+            return TTS_MANUAL_MIN_SCORE
+        if trigger_hint == TTS_TRIGGER_ECHO:
+            return TTS_ECHO_MIN_SCORE
+        return TTS_AUTO_MIN_SCORE
+
+    @staticmethod
+    def _tts_segment_budget(
+        trigger_hint: str,
+        candidate_count: int,
+        total_units: int,
+    ) -> int:
+        if candidate_count <= 0 or total_units <= 0:
+            return 0
+        if trigger_hint == TTS_TRIGGER_MANUAL:
+            return min(TTS_MANUAL_MAX_SEGMENTS, candidate_count)
+        if trigger_hint == TTS_TRIGGER_ECHO:
+            return min(TTS_ECHO_MAX_SEGMENTS, candidate_count)
+        if trigger_hint == TTS_TRIGGER_AUTO:
+            return min(TTS_AUTO_MAX_SEGMENTS, candidate_count)
+        return 0
 
     def _build_tts_request_markup(self, user_id: Optional[int], text: str) -> Optional[Dict[str, Any]]:
         if user_id is None or not self._should_offer_tts_voice(int(user_id), text):
@@ -1129,6 +1197,8 @@ class TgCodexService:
 
         sentence_units = [part.strip() for part in re.split(r"(?<=[。！？!?；;…\.])\s*", cleaned) if part.strip()]
         if len(sentence_units) > 1:
+            if len(sentence_units) == 2:
+                return sentence_units
             if len(cleaned) <= CONVERSATION_MIN_SPLIT_CHARS and len(sentence_units) <= 2:
                 return [cleaned]
             return self._group_conversation_units(sentence_units)
@@ -1273,7 +1343,7 @@ class TgCodexService:
 
         if re.search(r"[！？!?~～…]", cleaned):
             score += 1
-        if re.search(r"(呀|啦|呢|嘛|喔|哦|哎|诶|嗯|哈|宝|乖|抱抱|想你|过来|别怕)", cleaned):
+        if re.search(r"(呀|啦|呢|嘛|喔|哦|哎|诶|嗯|哈|好的|收到|可以|行)", cleaned):
             score += 2
         if cleaned.endswith(("。", "！", "？", "!", "?", "~", "～", "…")):
             score += 1
@@ -1287,20 +1357,12 @@ class TgCodexService:
 
         return score
 
-    def _tts_segment_budget(self, user_id: Optional[int], candidate_count: int) -> int:
-        if candidate_count <= 0:
-            return 0
-        frequency = self._tts_frequency_for_user(user_id)
-        if frequency == "low":
-            return 1
-        if frequency == "high":
-            return min(4, candidate_count)
-        return min(2, candidate_count)
-
     def _build_reply_delivery_segments(
         self,
         text: str,
         user_id: Optional[int],
+        *,
+        trigger_hint: str = TTS_TRIGGER_AUTO,
     ) -> List[Tuple[str, bool]]:
         cleaned = (text or "").strip()
         if not cleaned:
@@ -1312,20 +1374,38 @@ class TgCodexService:
         if not units:
             return [(cleaned, False)]
 
+        normalized_trigger = trigger_hint
+        if normalized_trigger not in {
+            TTS_TRIGGER_NONE,
+            TTS_TRIGGER_MANUAL,
+            TTS_TRIGGER_ECHO,
+            TTS_TRIGGER_AUTO,
+        }:
+            normalized_trigger = TTS_TRIGGER_AUTO
+        if normalized_trigger == TTS_TRIGGER_NONE:
+            return [(cleaned, False)]
+        if normalized_trigger == TTS_TRIGGER_AUTO and self._auto_tts_cooldown_active(user_id):
+            return [(cleaned, False)]
+
         candidates: List[Tuple[int, int]] = []
+        min_score = self._tts_trigger_min_score(normalized_trigger)
         for idx, unit in enumerate(units):
             if not self._should_offer_tts_voice(int(user_id), unit):
                 continue
             score = self._tts_segment_score(unit)
-            if score < 1:
+            if score < min_score:
                 continue
             candidates.append((idx, score))
 
-        budget = self._tts_segment_budget(user_id, len(candidates))
+        budget = self._tts_segment_budget(normalized_trigger, len(candidates), len(units))
         selected_indexes: Set[int] = set()
         if budget > 0 and candidates:
-            for idx, _score in sorted(candidates, key=lambda item: (-item[1], item[0]))[:budget]:
-                selected_indexes.add(idx)
+            if normalized_trigger in {TTS_TRIGGER_MANUAL, TTS_TRIGGER_ECHO}:
+                for idx, _score in candidates[:budget]:
+                    selected_indexes.add(idx)
+            else:
+                for idx, _score in sorted(candidates, key=lambda item: (-item[1], item[0]))[:budget]:
+                    selected_indexes.add(idx)
 
         segments: List[Tuple[str, bool]] = []
         current_text = ""
@@ -1379,6 +1459,7 @@ class TgCodexService:
         user_id: int,
         segments: List[Tuple[str, bool]],
         *,
+        trigger_hint: str = TTS_TRIGGER_AUTO,
         stream_message_id: Optional[int] = None,
         progressive_replay: bool = False,
     ) -> None:
@@ -1388,20 +1469,25 @@ class TgCodexService:
 
         log(
             "delivery segments: "
-            f"chat_id={chat_id} segments={[(len(text), 'voice' if is_voice else 'text') for text, is_voice in normalized_segments[:8]]}"
+            f"chat_id={chat_id} trigger={trigger_hint} "
+            f"segments={[(len(text), 'voice' if is_voice else 'text') for text, is_voice in normalized_segments[:8]]}"
         )
 
         pending_reply_to = reply_to
         remaining = list(normalized_segments)
+        used_voice = False
         if stream_message_id is not None:
             first_text = next(((idx, text) for idx, (text, is_voice) in enumerate(remaining) if not is_voice), None)
             if first_text is not None and first_text[0] == 0:
                 first_text_value = first_text[1]
+                first_text_parts = self._conversation_parts(first_text_value)
+                if not first_text_parts:
+                    first_text_parts = [first_text_value]
                 try:
-                    self.api.edit_message_text(chat_id, stream_message_id, first_text_value)
+                    self.api.edit_message_text(chat_id, stream_message_id, first_text_parts[0])
                     pending_reply_to = None
-                    remaining = remaining[1:]
-                    if progressive_replay and not remaining and len(first_text_value) > 240:
+                    remaining = [(part, False) for part in first_text_parts[1:]] + remaining[1:]
+                    if progressive_replay and not remaining and len(first_text_parts) == 1 and len(first_text_value) > 240:
                         full = first_text_value
                         step = 120
                         interval_sec = 0.12
@@ -1443,6 +1529,8 @@ class TgCodexService:
                         reply_to=current_reply_to,
                         user_id=user_id,
                     )
+                else:
+                    used_voice = True
             else:
                 self._send_conversation_message(
                     chat_id,
@@ -1451,6 +1539,12 @@ class TgCodexService:
                     user_id=user_id,
                 )
             pending_reply_to = None
+
+        self.state.record_voice_reply_result(
+            user_id,
+            used_voice=used_voice,
+            reason=trigger_hint,
+        )
 
     def _ensure_heartbeat_thread(self) -> None:
         if self._heartbeat_thread is not None:
@@ -2232,7 +2326,7 @@ class TgCodexService:
             if synth is None:
                 self.api.answer_callback_query(cq_id, text="你还没配好语音 key 或 voice_id。", show_alert=True)
                 return
-            self.api.answer_callback_query(cq_id, text="好，我现在开口。")
+            self.api.answer_callback_query(cq_id, text="正在生成语音。")
             worker = threading.Thread(
                 target=self._run_tts_callback_worker,
                 args=(chat_id, reply_to, int(user_id), token),
@@ -2264,7 +2358,7 @@ class TgCodexService:
                     "/status - 查看当前绑定会话",
                     "/ask <内容> - 手动提问（可选）",
                     "/heartbeat [status|on N|off|now] - 开关主动心跳",
-                    "/voice - 配置语音 key、voice_id 和语音频率",
+                    "/voice - 配置语音 key 和 voice_id",
                     "执行 /sessions 后，可直接发送编号切换会话",
                     "执行 /sessions 后，也可点击按钮直接切换会话",
                     "后台执行时仍可发送 /use /sessions /status",
@@ -2533,19 +2627,6 @@ class TgCodexService:
             self._send_message(chat_id, f"语音音色已经换成 {payload}。", reply_to=reply_to)
             return
 
-        if action in {"freq", "frequency"}:
-            if not payload:
-                self._send_message(chat_id, "示例：/voice freq medium", reply_to=reply_to)
-                return
-            if not _is_known_tts_frequency(payload):
-                self._send_message(chat_id, "频率只支持 high / medium / low，也可以直接发 高 / 中 / 低。", reply_to=reply_to)
-                return
-            normalized = _normalize_tts_frequency(payload)
-            self.state.update_voice_settings(user_id, frequency=normalized)
-            label = TTS_FREQUENCY_LABELS.get(normalized, "中")
-            self._send_message(chat_id, f"语音频率已经调成{label}档。", reply_to=reply_to)
-            return
-
         if action == "clear":
             self.state.update_voice_settings(user_id, clear=True)
             self._send_message(chat_id, "语音配置已经清空了。", reply_to=reply_to)
@@ -2553,7 +2634,7 @@ class TgCodexService:
 
         self._send_message(
             chat_id,
-            "用法：/voice | /voice key <API_KEY> | /voice voice <voice_id> | /voice freq <high|medium|low> | /voice clear",
+            "用法：/voice | /voice key <API_KEY> | /voice voice <voice_id> | /voice clear",
             reply_to=reply_to,
         )
 
@@ -2661,6 +2742,7 @@ class TgCodexService:
             user_id,
             self._decorate_text_prompt_with_context(prompt, message_ts),
             memory_source_text=prompt,
+            voice_trigger_hint=self._resolve_reply_tts_trigger(user_id, prompt, source_kind="text"),
         )
 
     def _handle_new(self, chat_id: int, reply_to: int, user_id: int, arg: str) -> None:
@@ -2695,6 +2777,7 @@ class TgCodexService:
             user_id,
             self._decorate_text_prompt_with_context(text, message_ts),
             memory_source_text=text,
+            voice_trigger_hint=self._resolve_reply_tts_trigger(user_id, text, source_kind="text"),
         )
 
     def _handle_audio_message(
@@ -2927,6 +3010,7 @@ class TgCodexService:
         prompt: str,
         image_paths: Optional[List[Path]] = None,
         memory_source_text: Optional[str] = None,
+        voice_trigger_hint: str = TTS_TRIGGER_AUTO,
     ) -> None:
         active_id, active_cwd = self.state.get_active(user_id)
         cwd = Path(active_cwd).expanduser() if active_cwd else self.default_cwd
@@ -2953,7 +3037,18 @@ class TgCodexService:
 
         worker = threading.Thread(
             target=self._run_prompt_worker,
-            args=(chat_id, reply_to, user_id, prompt, active_id, cwd, session_label, image_paths, memory_source_text),
+            args=(
+                chat_id,
+                reply_to,
+                user_id,
+                prompt,
+                active_id,
+                cwd,
+                session_label,
+                image_paths,
+                memory_source_text,
+                voice_trigger_hint,
+            ),
             daemon=True,
         )
         try:
@@ -2973,6 +3068,7 @@ class TgCodexService:
         session_label: str,
         image_paths: Optional[List[Path]] = None,
         memory_source_text: Optional[str] = None,
+        voice_trigger_hint: str = TTS_TRIGGER_AUTO,
     ) -> None:
         prompt = self._decorate_new_thread_prompt(prompt, active_id)
         prompt = self._decorate_prompt_with_memory_context(user_id, prompt, memory_source_text, active_id)
@@ -3144,7 +3240,11 @@ class TgCodexService:
 
         self._schedule_memory_writeback(user_id, cwd, memory_source_text)
         answer = self._format_prompt_response(final_session_label, answer)
-        delivery_segments = self._build_reply_delivery_segments(answer, user_id)
+        delivery_segments = self._build_reply_delivery_segments(
+            answer,
+            user_id,
+            trigger_hint=voice_trigger_hint,
+        )
 
         if stream_message_id is not None:
             replay = int(stream_state.get("content_updates") or 0) == 0
@@ -3153,6 +3253,7 @@ class TgCodexService:
                 reply_to,
                 user_id,
                 delivery_segments,
+                trigger_hint=voice_trigger_hint,
                 stream_message_id=stream_message_id,
                 progressive_replay=replay,
             )
@@ -3163,6 +3264,7 @@ class TgCodexService:
             reply_to,
             user_id,
             delivery_segments,
+            trigger_hint=voice_trigger_hint,
         )
 
     def _run_audio_prompt_worker(
@@ -3231,6 +3333,7 @@ class TgCodexService:
             cwd=cwd,
             session_label=session_label,
             memory_source_text="\n".join(part for part in [caption.strip(), transcript] if part.strip()),
+            voice_trigger_hint=self._resolve_reply_tts_trigger(user_id, transcript, source_kind=kind),
         )
 
     def _run_attachment_prompt_worker(
@@ -3274,6 +3377,7 @@ class TgCodexService:
             session_label=session_label,
             image_paths=image_paths,
             memory_source_text=caption,
+            voice_trigger_hint=self._resolve_reply_tts_trigger(user_id, caption, source_kind=kind),
         )
 
     def _run_tts_callback_worker(
@@ -3290,7 +3394,7 @@ class TgCodexService:
 
         text = str(request.get("text") or "").strip()
         if not text:
-            self._send_message(chat_id, "这条语音内容是空的，我没法开口。", reply_to=reply_to)
+            self._send_message(chat_id, "这条语音内容为空，无法生成语音。", reply_to=reply_to)
             return
 
         self._deliver_tts_voice(
@@ -3331,7 +3435,7 @@ class TgCodexService:
         cleaned = str(text or "").strip()
         if not cleaned:
             if notify_errors:
-                self._send_message(chat_id, "这条语音内容是空的，我没法开口。", reply_to=reply_to)
+                self._send_message(chat_id, "这条语音内容为空，无法生成语音。", reply_to=reply_to)
             return False
 
         try:
