@@ -230,25 +230,31 @@ Notes:
 
 ## Telegram TTS Replies
 
-Telegram can also append a local GPT-SoVITS voice note after a normal text reply.
+Telegram can also offer an optional voice reply after a normal text response.
 
 Notes:
 
-- Text replies still go out as normal; TTS adds a separate voice note after the text
-- `TG_TTS_MODE=auto` only speaks short conversational replies and skips code blocks, file paths, command output, and long responses
-- The bot auto-starts `api_v2.py` from `TG_TTS_GSV_ROOT` on first use when the local GPT-SoVITS environment is ready
-- Typical local config looks like this:
+- Text replies still go out as normal first
+- `TG_TTS_MODE=auto` only sends voice for short conversational replies and skips code blocks, file paths, command output, and long responses
+- The bot can mix voice and text inside one reply; it decides which chunks are worth speaking and keeps the rest as normal text
+- `/voice` lets you configure the current Telegram user's TTS credentials and voice frequency directly in chat
+- Default MiniMax CN config looks like this:
 
 ```bash
 export TG_TTS_ENABLED=1
-export TG_TTS_BACKEND="local-gpt-sovits"
+export TG_TTS_BACKEND="minimax"
 export TG_TTS_MODE="auto"
-export TG_TTS_API_BASE="http://127.0.0.1:9880"
-export TG_TTS_GSV_ROOT="C:/COVE/GPT-SoVITS/GPT-SoVITS"
-export TG_TTS_REF_AUDIO_PATH="C:/COVE/Cove_GSV/Cove_GSV/reference_audios/中文/emotions/【默认】还有编写和调试计算机程序的能力。.wav"
-export TG_TTS_PROMPT_TEXT="还有编写和调试计算机程序的能力。"
-export TG_TTS_GPT_WEIGHTS="GPT_weights/Cove_ZH-e12.ckpt"
-export TG_TTS_SOVITS_WEIGHTS="SoVITS_weights/Cove_ZH_e8_s320.pth"
+export TG_TTS_API_BASE="https://api.minimaxi.com/v1"
+export TG_TTS_MODEL_DEFAULT="speech-2.8-turbo"
+export TG_TTS_FFMPEG_BIN="C:/path/to/ffmpeg.exe"
+```
+
+Then configure your user-specific credentials in Telegram:
+
+```text
+/voice key <YOUR_API_KEY>
+/voice voice <voice_id>
+/voice freq <high|medium|low>
 ```
 
 ## Telegram Memory

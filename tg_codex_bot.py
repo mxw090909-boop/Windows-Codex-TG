@@ -38,8 +38,11 @@ from codex_common import (
     resolve_codex_bin,
 )
 from tg_tts import (
+    DEFAULT_MINIMAX_API_BASE,
+    DEFAULT_MINIMAX_MODEL,
     DEFAULT_TTS_MAX_CHARS,
     LocalGptSovitsTtsSynthesizer,
+    MiniMaxTtsSynthesizer,
     SynthesizedVoiceNote,
     is_tts_reply_candidate,
 )
@@ -61,6 +64,7 @@ BOT_COMMANDS: List[Dict[str, str]] = [
 
 BOT_COMMANDS.append({"command": "heartbeat", "description": "定时主动来找你"})
 BOT_COMMANDS.append({"command": "memory", "description": "查看和管理记忆"})
+BOT_COMMANDS.append({"command": "voice", "description": "配置语音回复"})
 
 HEARTBEAT_MIN_INTERVAL_SEC = 60
 HEARTBEAT_DEFAULT_INTERVAL_SEC = 30 * 60
@@ -92,6 +96,14 @@ MEMORY_CATEGORY_LABELS = {
     "boundary": "边界",
     "relationship": "关系",
     "general": "记忆",
+}
+TTS_CALLBACK_PREFIX = "tts:"
+TTS_BUTTON_TEXT = "听我说"
+TTS_FREQUENCY_DEFAULT = "medium"
+TTS_FREQUENCY_LABELS = {
+    "high": "高",
+    "medium": "中",
+    "low": "低",
 }
 NEW_THREAD_PERSONA_PROMPT = ""
 MEMORY_CONTEXT_PROMPT = ""
@@ -153,6 +165,30 @@ def _load_list_override(default: List[str], *, inline_env_name: str, path_env_na
     except Exception as e:
         log(f"[warn] failed to read {path_env_name} from {path}: {e}")
         return list(default)
+
+
+def _normalize_tts_frequency(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    mapping = {
+        "high": "high",
+        "h": "high",
+        "高": "high",
+        "medium": "medium",
+        "mid": "medium",
+        "m": "medium",
+        "中": "medium",
+        "normal": "medium",
+        "default": "medium",
+        "low": "low",
+        "l": "low",
+        "低": "low",
+    }
+    return mapping.get(raw, TTS_FREQUENCY_DEFAULT)
+
+
+def _is_known_tts_frequency(value: Any) -> bool:
+    raw = str(value or "").strip().lower()
+    return raw in {"high", "h", "高", "medium", "mid", "m", "中", "normal", "default", "low", "l", "低"}
 
 
 def _render_prompt_template(template: str, **values: str) -> str:
@@ -290,12 +326,15 @@ class TelegramAPI:
         chat_id: int,
         message_id: int,
         text: str,
+        reply_markup: Optional[Dict[str, Any]] = None,
     ) -> None:
         payload: Dict[str, Any] = {
             "chat_id": chat_id,
             "message_id": message_id,
             "text": text,
         }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         self._request("editMessageText", payload)
 
     def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
@@ -354,6 +393,9 @@ class TelegramAPI:
                 )
             ],
         )
+
+    def delete_message(self, chat_id: int, message_id: int) -> None:
+        self._request("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
 
 
 def normalize_audio_filename(file_name: Optional[str], mime_type: Optional[str]) -> Tuple[str, str]:
@@ -767,8 +809,13 @@ class TgCodexService:
         memory_context_prompt: Optional[str] = MEMORY_CONTEXT_PROMPT,
         memory_writeback_prompt: Optional[str] = MEMORY_WRITEBACK_PROMPT,
         memory_auto_enabled: bool = True,
+        tts_backend: str = "disabled",
         tts_mode: str = "auto",
         tts_max_chars: int = DEFAULT_TTS_MAX_CHARS,
+        tts_api_base: str = "",
+        tts_default_model: str = "",
+        tts_ffmpeg_bin: Optional[str] = None,
+        tts_cache_dir: Optional[Path] = None,
     ):
         self.api = api
         self.sessions = sessions
@@ -815,8 +862,15 @@ class TgCodexService:
             MEMORY_WRITEBACK_PROMPT if memory_writeback_prompt is None else str(memory_writeback_prompt)
         ).strip()
         self.memory_auto_enabled = bool(memory_auto_enabled)
+        self.tts_backend = (tts_backend or "disabled").strip().lower() or "disabled"
         self.tts_mode = (tts_mode or "auto").strip().lower() or "auto"
         self.tts_max_chars = max(40, int(tts_max_chars))
+        self.tts_api_base = str(tts_api_base or "").strip()
+        self.tts_default_model = str(tts_default_model or "").strip()
+        self.tts_ffmpeg_bin = str(tts_ffmpeg_bin or "").strip() or None
+        self.tts_cache_dir = Path(tts_cache_dir).expanduser() if tts_cache_dir else None
+        if self.tts_cache_dir is not None:
+            self.tts_cache_dir.mkdir(parents=True, exist_ok=True)
         self.running_prompts = RunningPromptRegistry()
         self.offset: Optional[int] = None
         self.heartbeat_default_interval_sec = HEARTBEAT_DEFAULT_INTERVAL_SEC
@@ -915,8 +969,57 @@ class TgCodexService:
             self.state.touch_assistant(target_user_id, chat_id)
         return result
 
-    def _should_send_tts_voice(self, text: str) -> bool:
-        if self.tts_synthesizer is None:
+    def _discard_message(self, chat_id: int, message_id: Optional[int]) -> None:
+        if message_id is None:
+            return
+        try:
+            self.api.delete_message(chat_id, int(message_id))
+        except Exception as e:
+            log(f"delete message failed: chat_id={chat_id} message_id={message_id} error={e}")
+
+    @staticmethod
+    def _mask_secret(value: str) -> str:
+        cleaned = str(value or "").strip()
+        if len(cleaned) <= 10:
+            return "*" * max(4, len(cleaned))
+        return f"{cleaned[:6]}...{cleaned[-4:]}"
+
+    def _tts_settings_for_user(self, user_id: int) -> Dict[str, Any]:
+        settings = self.state.get_voice_settings(user_id)
+        return settings if isinstance(settings, dict) else {}
+
+    def _tts_status_lines(self, user_id: int) -> List[str]:
+        settings = self._tts_settings_for_user(user_id)
+        api_key = str(settings.get("api_key") or "").strip()
+        voice_id = str(settings.get("voice_id") or "").strip()
+        model = str(settings.get("model") or self.tts_default_model or "").strip()
+        frequency = _normalize_tts_frequency(settings.get("frequency"))
+        if self.tts_backend == "disabled":
+            return ["语音回复现在还没开。"]
+        lines = [
+            "语音回复配置：",
+            f"backend: {self.tts_backend}",
+            f"API key: {'已设置（' + self._mask_secret(api_key) + '）' if api_key else '未设置'}",
+            f"voice_id: {voice_id or '未设置'}",
+            f"频率: {TTS_FREQUENCY_LABELS.get(frequency, '中')}",
+        ]
+        if model:
+            lines.append(f"model: {model}")
+        lines.append("用法：/voice key <API_KEY> | /voice voice <voice_id> | /voice freq <high|medium|low> | /voice clear")
+        return lines
+
+    def _tts_feature_ready_for_user(self, user_id: int) -> bool:
+        if self.tts_backend == "local-gpt-sovits":
+            return self.tts_synthesizer is not None
+        if self.tts_backend == "minimax":
+            settings = self._tts_settings_for_user(user_id)
+            return bool(str(settings.get("api_key") or "").strip() and str(settings.get("voice_id") or "").strip())
+        return False
+
+    def _should_offer_tts_voice(self, user_id: Optional[int], text: str) -> bool:
+        if user_id is None:
+            return False
+        if not self._tts_feature_ready_for_user(int(user_id)):
             return False
         return is_tts_reply_candidate(
             text,
@@ -924,7 +1027,75 @@ class TgCodexService:
             max_chars=self.tts_max_chars,
         )
 
-    def _maybe_send_conversation_voice(
+    def _tts_frequency_for_user(self, user_id: Optional[int]) -> str:
+        if user_id is None:
+            return TTS_FREQUENCY_DEFAULT
+        settings = self._tts_settings_for_user(int(user_id))
+        return _normalize_tts_frequency(settings.get("frequency"))
+
+    def _build_tts_request_markup(self, user_id: Optional[int], text: str) -> Optional[Dict[str, Any]]:
+        if user_id is None or not self._should_offer_tts_voice(int(user_id), text):
+            return None
+        settings = self._tts_settings_for_user(int(user_id))
+        token = self.state.create_tts_request(
+            int(user_id),
+            text=text,
+            voice_id=str(settings.get("voice_id") or "").strip() or None,
+            model=str(settings.get("model") or self.tts_default_model or "").strip() or None,
+        )
+        if not token:
+            return None
+        return {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": TTS_BUTTON_TEXT,
+                        "callback_data": f"{TTS_CALLBACK_PREFIX}{token}",
+                    }
+                ]
+            ]
+        }
+
+    def _build_user_tts_synthesizer(
+        self,
+        user_id: int,
+        request: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Any]:
+        if self.tts_backend == "local-gpt-sovits":
+            return self.tts_synthesizer
+        if self.tts_backend != "minimax":
+            return None
+
+        settings = self._tts_settings_for_user(user_id)
+        api_key = str(settings.get("api_key") or "").strip()
+        voice_id = str((request or {}).get("voice_id") or settings.get("voice_id") or "").strip()
+        model = str((request or {}).get("model") or settings.get("model") or self.tts_default_model or "").strip()
+        if not api_key or not voice_id:
+            return None
+        synth = MiniMaxTtsSynthesizer(
+            api_key=api_key,
+            voice_id=voice_id,
+            api_base=self.tts_api_base,
+            model=model or self.tts_default_model,
+            ffmpeg_bin=self.tts_ffmpeg_bin,
+            cache_dir=(self.tts_cache_dir / str(user_id)) if self.tts_cache_dir is not None else None,
+            max_chars=self.tts_max_chars,
+        )
+        synth.validate_environment()
+        return synth
+
+    def _maybe_offer_conversation_voice(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        reply_to: Optional[int] = None,
+        user_id: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        _ = reply_to
+        return self._build_tts_request_markup(user_id, text)
+
+    def _queue_conversation_voice_reply(
         self,
         chat_id: int,
         text: str,
@@ -932,28 +1103,17 @@ class TgCodexService:
         reply_to: Optional[int] = None,
         user_id: Optional[int] = None,
     ) -> None:
-        if not self._should_send_tts_voice(text):
+        if user_id is None:
             return
-
-        assert self.tts_synthesizer is not None
-        try:
-            self.api.send_chat_action(chat_id, "record_voice")
-        except Exception:
-            pass
-
-        try:
-            voice = self.tts_synthesizer.synthesize_voice_note(text)
-            try:
-                self.api.send_chat_action(chat_id, "upload_voice")
-            except Exception:
-                pass
-            self._send_voice(chat_id, voice, reply_to=reply_to, user_id=user_id)
-            log(
-                "tts voice sent: "
-                f"chat_id={chat_id} bytes={len(voice.audio_bytes)} mode={self.tts_mode}"
-            )
-        except Exception as e:
-            log(f"tts voice generation failed: chat_id={chat_id} error={e}")
+        normalized_user_id = int(user_id)
+        if not self._should_offer_tts_voice(normalized_user_id, text):
+            return
+        worker = threading.Thread(
+            target=self._run_tts_reply_worker,
+            args=(chat_id, reply_to, normalized_user_id, text),
+            daemon=True,
+        )
+        worker.start()
 
     def _split_conversation_paragraph(self, text: str) -> List[str]:
         cleaned = (text or "").strip()
@@ -1065,12 +1225,136 @@ class TgCodexService:
 
         return [part for part in parts if part] or [cleaned]
 
+    def _voice_delivery_units(self, text: str) -> List[str]:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return []
+
+        units: List[str] = []
+        for block, is_code in self._conversation_blocks(cleaned):
+            if is_code:
+                units.append(block.strip())
+                continue
+
+            paragraphs = [part.strip() for part in re.split(r"\n+", block) if part.strip()]
+            if not paragraphs:
+                paragraphs = [block.strip()]
+
+            for paragraph in paragraphs:
+                sentence_units = [
+                    part.strip()
+                    for part in re.split(
+                        r"(?<=[。！？!?；;…])\s*|(?<=\.)\s+(?=[A-Z0-9\"“‘'])",
+                        paragraph,
+                    )
+                    if part.strip()
+                ]
+                if not sentence_units:
+                    sentence_units = [paragraph.strip()]
+                units.extend(sentence_units)
+
+        return [unit for unit in units if unit]
+
+    def _tts_segment_score(self, text: str) -> int:
+        cleaned = " ".join((text or "").split()).strip()
+        if not cleaned:
+            return -999
+
+        score = 0
+        length = len(cleaned)
+        if length <= 18:
+            score += 3
+        elif length <= 36:
+            score += 2
+        elif length <= 80:
+            score += 1
+        else:
+            score -= 1
+
+        if re.search(r"[！？!?~～…]", cleaned):
+            score += 1
+        if re.search(r"(呀|啦|呢|嘛|喔|哦|哎|诶|嗯|哈|宝|乖|抱抱|想你|过来|别怕)", cleaned):
+            score += 2
+        if cleaned.endswith(("。", "！", "？", "!", "?", "~", "～", "…")):
+            score += 1
+
+        if re.search(r"```|stderr:|Traceback|https?://|[A-Za-z]:\\", cleaned):
+            score -= 4
+        if re.search(r"^[-*]\s|\d+[.)、]\s", cleaned):
+            score -= 2
+        if re.fullmatch(r"[0-9A-Za-z_./:\\-]+", cleaned):
+            score -= 2
+
+        return score
+
+    def _tts_segment_budget(self, user_id: Optional[int], candidate_count: int) -> int:
+        if candidate_count <= 0:
+            return 0
+        frequency = self._tts_frequency_for_user(user_id)
+        if frequency == "low":
+            return 1
+        if frequency == "high":
+            return min(4, candidate_count)
+        return min(2, candidate_count)
+
+    def _build_reply_delivery_segments(
+        self,
+        text: str,
+        user_id: Optional[int],
+    ) -> List[Tuple[str, bool]]:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return [("...", False)]
+        if user_id is None or not self._tts_feature_ready_for_user(int(user_id)):
+            return [(cleaned, False)]
+
+        units = self._voice_delivery_units(cleaned)
+        if not units:
+            return [(cleaned, False)]
+
+        candidates: List[Tuple[int, int]] = []
+        for idx, unit in enumerate(units):
+            if not self._should_offer_tts_voice(int(user_id), unit):
+                continue
+            score = self._tts_segment_score(unit)
+            if score < 1:
+                continue
+            candidates.append((idx, score))
+
+        budget = self._tts_segment_budget(user_id, len(candidates))
+        selected_indexes: Set[int] = set()
+        if budget > 0 and candidates:
+            for idx, _score in sorted(candidates, key=lambda item: (-item[1], item[0]))[:budget]:
+                selected_indexes.add(idx)
+
+        segments: List[Tuple[str, bool]] = []
+        current_text = ""
+        current_is_voice: Optional[bool] = None
+        for idx, unit in enumerate(units):
+            is_voice = idx in selected_indexes
+            if current_is_voice is None:
+                current_text = unit
+                current_is_voice = is_voice
+                continue
+            if current_is_voice == is_voice:
+                current_text += unit
+                continue
+            if current_text.strip():
+                segments.append((current_text.strip(), bool(current_is_voice)))
+            current_text = unit
+            current_is_voice = is_voice
+
+        if current_text.strip():
+            segments.append((current_text.strip(), bool(current_is_voice)))
+        return segments or [(cleaned, False)]
+
     def _send_conversation_message(
         self,
         chat_id: int,
         text: str,
         reply_to: Optional[int] = None,
         user_id: Optional[int] = None,
+        reply_markup: Optional[Dict[str, Any]] = None,
     ) -> None:
         parts = self._conversation_parts(text)
         log(
@@ -1083,9 +1367,90 @@ class TgCodexService:
                 part,
                 reply_to=reply_to if idx == 0 else None,
                 user_id=user_id,
+                reply_markup=reply_markup if idx == len(parts) - 1 else None,
             )
             if idx < len(parts) - 1:
                 time.sleep(CONVERSATION_PART_DELAY_SEC)
+
+    def _send_delivery_segments(
+        self,
+        chat_id: int,
+        reply_to: Optional[int],
+        user_id: int,
+        segments: List[Tuple[str, bool]],
+        *,
+        stream_message_id: Optional[int] = None,
+        progressive_replay: bool = False,
+    ) -> None:
+        normalized_segments = [(str(text or "").strip(), bool(is_voice)) for text, is_voice in segments if str(text or "").strip()]
+        if not normalized_segments:
+            normalized_segments = [("Codex 没有返回可展示内容。", False)]
+
+        log(
+            "delivery segments: "
+            f"chat_id={chat_id} segments={[(len(text), 'voice' if is_voice else 'text') for text, is_voice in normalized_segments[:8]]}"
+        )
+
+        pending_reply_to = reply_to
+        remaining = list(normalized_segments)
+        if stream_message_id is not None:
+            first_text = next(((idx, text) for idx, (text, is_voice) in enumerate(remaining) if not is_voice), None)
+            if first_text is not None and first_text[0] == 0:
+                first_text_value = first_text[1]
+                try:
+                    self.api.edit_message_text(chat_id, stream_message_id, first_text_value)
+                    pending_reply_to = None
+                    remaining = remaining[1:]
+                    if progressive_replay and not remaining and len(first_text_value) > 240:
+                        full = first_text_value
+                        step = 120
+                        interval_sec = 0.12
+                        for end in range(step, len(full), step):
+                            partial = full[:end].rstrip()
+                            if not partial:
+                                continue
+                            preview = f"{partial}\n\n[生成中...]"
+                            try:
+                                self.api.edit_message_text(chat_id, stream_message_id, preview)
+                            except Exception:
+                                break
+                            time.sleep(interval_sec)
+                        try:
+                            self.api.edit_message_text(chat_id, stream_message_id, full)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    log(f"stream final edit failed: {e}")
+                    self._discard_message(chat_id, stream_message_id)
+            else:
+                self._discard_message(chat_id, stream_message_id)
+
+        for idx, (segment_text, is_voice) in enumerate(remaining):
+            current_reply_to = pending_reply_to if idx == 0 else None
+            if is_voice:
+                voice_sent = self._deliver_tts_voice(
+                    chat_id,
+                    reply_to=current_reply_to,
+                    user_id=user_id,
+                    text=segment_text,
+                    request=None,
+                    notify_errors=False,
+                )
+                if not voice_sent:
+                    self._send_conversation_message(
+                        chat_id,
+                        segment_text,
+                        reply_to=current_reply_to,
+                        user_id=user_id,
+                    )
+            else:
+                self._send_conversation_message(
+                    chat_id,
+                    segment_text,
+                    reply_to=current_reply_to,
+                    user_id=user_id,
+                )
+            pending_reply_to = None
 
     def _ensure_heartbeat_thread(self) -> None:
         if self._heartbeat_thread is not None:
@@ -1822,6 +2187,9 @@ class TgCodexService:
         if cmd == "memory":
             self._handle_memory(chat_id, message_id, int(user_id), arg)
             return
+        if cmd == "voice":
+            self._handle_voice(chat_id, message_id, int(user_id), arg)
+            return
 
         self._send_message(chat_id, f"未知命令: /{cmd}\n发送 /help 查看说明。", reply_to=message_id)
 
@@ -1850,6 +2218,29 @@ class TgCodexService:
             self._switch_to_session(chat_id, reply_to, int(user_id), session_id)
             return
 
+        if data.startswith(TTS_CALLBACK_PREFIX):
+            token = data[len(TTS_CALLBACK_PREFIX) :].strip()
+            request = self.state.get_tts_request(int(user_id), token)
+            if not request:
+                self.api.answer_callback_query(cq_id, text="这条语音入口已经失效了。", show_alert=True)
+                return
+            try:
+                synth = self._build_user_tts_synthesizer(int(user_id), request)
+            except Exception as e:
+                self.api.answer_callback_query(cq_id, text=f"语音配置不可用：{e}", show_alert=True)
+                return
+            if synth is None:
+                self.api.answer_callback_query(cq_id, text="你还没配好语音 key 或 voice_id。", show_alert=True)
+                return
+            self.api.answer_callback_query(cq_id, text="好，我现在开口。")
+            worker = threading.Thread(
+                target=self._run_tts_callback_worker,
+                args=(chat_id, reply_to, int(user_id), token),
+                daemon=True,
+            )
+            worker.start()
+            return
+
         self.api.answer_callback_query(cq_id, text="不支持的操作。", show_alert=True)
 
     @staticmethod
@@ -1873,6 +2264,7 @@ class TgCodexService:
                     "/status - 查看当前绑定会话",
                     "/ask <内容> - 手动提问（可选）",
                     "/heartbeat [status|on N|off|now] - 开关主动心跳",
+                    "/voice - 配置语音 key、voice_id 和语音频率",
                     "执行 /sessions 后，可直接发送编号切换会话",
                     "执行 /sessions 后，也可点击按钮直接切换会话",
                     "后台执行时仍可发送 /use /sessions /status",
@@ -2108,6 +2500,60 @@ class TgCodexService:
         self._send_message(
             chat_id,
             "用法：/memory | /memory add <内容> | /memory forget <id> | /memory pin <id> | /memory unpin <id> | /memory search <关键词>",
+            reply_to=reply_to,
+        )
+
+    def _handle_voice(self, chat_id: int, reply_to: int, user_id: int, arg: str) -> None:
+        raw = (arg or "").strip()
+        if not raw or raw.lower() == "status":
+            self._send_message(chat_id, "\n".join(self._tts_status_lines(user_id)), reply_to=reply_to)
+            return
+
+        action, _, remainder = raw.partition(" ")
+        action = action.lower().strip()
+        payload = remainder.strip()
+
+        if action == "key":
+            if not payload:
+                self._send_message(chat_id, "示例：/voice key sk-xxxxx", reply_to=reply_to)
+                return
+            self.state.update_voice_settings(user_id, api_key=payload)
+            self._send_message(
+                chat_id,
+                f"语音 API key 记住了，现在是 {self._mask_secret(payload)}。",
+                reply_to=reply_to,
+            )
+            return
+
+        if action == "voice":
+            if not payload:
+                self._send_message(chat_id, "示例：/voice voice male-qn-qingse", reply_to=reply_to)
+                return
+            self.state.update_voice_settings(user_id, voice_id=payload)
+            self._send_message(chat_id, f"语音音色已经换成 {payload}。", reply_to=reply_to)
+            return
+
+        if action in {"freq", "frequency"}:
+            if not payload:
+                self._send_message(chat_id, "示例：/voice freq medium", reply_to=reply_to)
+                return
+            if not _is_known_tts_frequency(payload):
+                self._send_message(chat_id, "频率只支持 high / medium / low，也可以直接发 高 / 中 / 低。", reply_to=reply_to)
+                return
+            normalized = _normalize_tts_frequency(payload)
+            self.state.update_voice_settings(user_id, frequency=normalized)
+            label = TTS_FREQUENCY_LABELS.get(normalized, "中")
+            self._send_message(chat_id, f"语音频率已经调成{label}档。", reply_to=reply_to)
+            return
+
+        if action == "clear":
+            self.state.update_voice_settings(user_id, clear=True)
+            self._send_message(chat_id, "语音配置已经清空了。", reply_to=reply_to)
+            return
+
+        self._send_message(
+            chat_id,
+            "用法：/voice | /voice key <API_KEY> | /voice voice <voice_id> | /voice freq <high|medium|low> | /voice clear",
             reply_to=reply_to,
         )
 
@@ -2403,6 +2849,8 @@ class TgCodexService:
         stream_message_id: Optional[int],
         text: str,
         progressive_replay: bool = False,
+        user_id: Optional[int] = None,
+        reply_markup: Optional[Dict[str, Any]] = None,
     ) -> None:
         parts = self._conversation_parts(text or "Codex 没有返回可展示内容。")
         if not parts:
@@ -2416,13 +2864,24 @@ class TgCodexService:
         first_sent = False
         if stream_message_id is not None:
             try:
-                self.api.edit_message_text(chat_id, stream_message_id, parts[0])
+                self.api.edit_message_text(
+                    chat_id,
+                    stream_message_id,
+                    parts[0],
+                    reply_markup=reply_markup if len(parts) == 1 else None,
+                )
                 first_sent = True
             except Exception as e:
                 log(f"stream final edit failed: {e}")
 
         if not first_sent:
-            self._send_message(chat_id, parts[0], reply_to=reply_to)
+            self._send_message(
+                chat_id,
+                parts[0],
+                reply_to=reply_to,
+                user_id=user_id,
+                reply_markup=reply_markup if len(parts) == 1 else None,
+            )
             stream_message_id = None
 
         if progressive_replay and stream_message_id is not None and len(parts) == 1 and len(parts[0]) > 240:
@@ -2442,12 +2901,22 @@ class TgCodexService:
                 time.sleep(interval_sec)
             if stream_message_id is not None:
                 try:
-                    self.api.edit_message_text(chat_id, stream_message_id, full)
+                    self.api.edit_message_text(
+                        chat_id,
+                        stream_message_id,
+                        full,
+                        reply_markup=reply_markup if len(parts) == 1 else None,
+                    )
                 except Exception:
                     stream_message_id = None
 
-        for part in parts[1:]:
-            self._send_message(chat_id, part)
+        for idx, part in enumerate(parts[1:], start=1):
+            self._send_message(
+                chat_id,
+                part,
+                user_id=user_id,
+                reply_markup=reply_markup if idx == len(parts) - 1 else None,
+            )
             time.sleep(CONVERSATION_PART_DELAY_SEC)
 
     def _run_prompt(
@@ -2675,14 +3144,26 @@ class TgCodexService:
 
         self._schedule_memory_writeback(user_id, cwd, memory_source_text)
         answer = self._format_prompt_response(final_session_label, answer)
+        delivery_segments = self._build_reply_delivery_segments(answer, user_id)
+
         if stream_message_id is not None:
             replay = int(stream_state.get("content_updates") or 0) == 0
-            self._finalize_stream_reply(chat_id, reply_to, stream_message_id, answer, progressive_replay=replay)
-            self._maybe_send_conversation_voice(chat_id, answer, reply_to=reply_to, user_id=user_id)
+            self._send_delivery_segments(
+                chat_id,
+                reply_to,
+                user_id,
+                delivery_segments,
+                stream_message_id=stream_message_id,
+                progressive_replay=replay,
+            )
             return
 
-        self._send_conversation_message(chat_id, answer, reply_to=reply_to, user_id=user_id)
-        self._maybe_send_conversation_voice(chat_id, answer, reply_to=reply_to, user_id=user_id)
+        self._send_delivery_segments(
+            chat_id,
+            reply_to,
+            user_id,
+            delivery_segments,
+        )
 
     def _run_audio_prompt_worker(
         self,
@@ -2795,6 +3276,100 @@ class TgCodexService:
             memory_source_text=caption,
         )
 
+    def _run_tts_callback_worker(
+        self,
+        chat_id: int,
+        reply_to: Optional[int],
+        user_id: int,
+        token: str,
+    ) -> None:
+        request = self.state.get_tts_request(user_id, token)
+        if not request:
+            self._send_message(chat_id, "这条语音入口已经失效了。", reply_to=reply_to)
+            return
+
+        text = str(request.get("text") or "").strip()
+        if not text:
+            self._send_message(chat_id, "这条语音内容是空的，我没法开口。", reply_to=reply_to)
+            return
+
+        self._deliver_tts_voice(
+            chat_id,
+            reply_to=reply_to,
+            user_id=user_id,
+            text=text,
+            request=request,
+            notify_errors=True,
+        )
+
+    def _run_tts_reply_worker(
+        self,
+        chat_id: int,
+        reply_to: Optional[int],
+        user_id: int,
+        text: str,
+    ) -> None:
+        self._deliver_tts_voice(
+            chat_id,
+            reply_to=reply_to,
+            user_id=user_id,
+            text=text,
+            request=None,
+            notify_errors=False,
+        )
+
+    def _deliver_tts_voice(
+        self,
+        chat_id: int,
+        *,
+        reply_to: Optional[int],
+        user_id: int,
+        text: str,
+        request: Optional[Dict[str, Any]],
+        notify_errors: bool,
+    ) -> bool:
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            if notify_errors:
+                self._send_message(chat_id, "这条语音内容是空的，我没法开口。", reply_to=reply_to)
+            return False
+
+        try:
+            synth = self._build_user_tts_synthesizer(user_id, request)
+        except Exception as e:
+            log(f"tts synthesizer unavailable: user_id={user_id} error={e}")
+            if notify_errors:
+                self._send_message(chat_id, f"语音配置不可用：{e}", reply_to=reply_to)
+            return False
+
+        if synth is None:
+            if notify_errors:
+                self._send_message(chat_id, "你还没配好语音 key 或 voice_id。", reply_to=reply_to)
+            return False
+
+        try:
+            self.api.send_chat_action(chat_id, "record_voice")
+        except Exception:
+            pass
+
+        try:
+            voice = synth.synthesize_voice_note(cleaned)
+            try:
+                self.api.send_chat_action(chat_id, "upload_voice")
+            except Exception:
+                pass
+            self._send_voice(chat_id, voice, reply_to=reply_to, user_id=user_id)
+            log(
+                "tts voice sent: "
+                f"chat_id={chat_id} user_id={user_id} bytes={len(voice.audio_bytes)} backend={self.tts_backend}"
+            )
+            return True
+        except Exception as e:
+            log(f"tts voice generation failed: chat_id={chat_id} user_id={user_id} error={e}")
+            if notify_errors:
+                self._send_message(chat_id, f"语音生成失败：{e}", reply_to=reply_to)
+            return False
+
 def build_service() -> TgCodexService:
     token = env("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -2831,9 +3406,13 @@ def build_service() -> TgCodexService:
     tg_voice_local_language = env("TG_VOICE_LOCAL_LANGUAGE")
     tg_voice_ffmpeg_bin = env("TG_VOICE_FFMPEG_BIN")
     tg_tts_enabled = parse_bool_env(env("TG_TTS_ENABLED"), False)
-    tg_tts_backend = env("TG_TTS_BACKEND", "local-gpt-sovits")
+    tg_tts_backend = env("TG_TTS_BACKEND", "minimax")
     tg_tts_mode = env("TG_TTS_MODE", "auto")
-    tg_tts_api_base = env("TG_TTS_API_BASE", "http://127.0.0.1:9880")
+    tg_tts_api_base_default = (
+        DEFAULT_TTS_API_BASE if (tg_tts_backend or "").strip().lower() == "local-gpt-sovits" else DEFAULT_MINIMAX_API_BASE
+    )
+    tg_tts_api_base = env("TG_TTS_API_BASE", tg_tts_api_base_default)
+    tg_tts_model_default = env("TG_TTS_MODEL_DEFAULT", DEFAULT_MINIMAX_MODEL)
     tg_tts_gsv_root = env("TG_TTS_GSV_ROOT")
     tg_tts_ref_audio_path = env("TG_TTS_REF_AUDIO_PATH")
     tg_tts_prompt_text = env("TG_TTS_PROMPT_TEXT")
@@ -2848,6 +3427,7 @@ def build_service() -> TgCodexService:
     tg_tts_request_timeout_sec = parse_non_negative_int(env("TG_TTS_REQUEST_TIMEOUT_SEC", "240"), 240)
     tg_tts_speed_factor_raw = env("TG_TTS_SPEED_FACTOR", "1.0")
     tg_tts_max_chars = parse_non_negative_int(env("TG_TTS_MAX_CHARS", str(DEFAULT_TTS_MAX_CHARS)), DEFAULT_TTS_MAX_CHARS)
+    tg_tts_cache_dir = Path(env("TG_TTS_CACHE_DIR", str(SCRIPT_DIR / ".runtime" / "tts-cache"))).expanduser()
     try:
         tg_tts_speed_factor = float(tg_tts_speed_factor_raw or "1.0")
     except ValueError:
@@ -2984,7 +3564,7 @@ def build_service() -> TgCodexService:
     tts_synthesizer: Optional[LocalGptSovitsTtsSynthesizer] = None
     tts_backend_label = "disabled"
     if tg_tts_enabled:
-        backend = (tg_tts_backend or "local-gpt-sovits").strip().lower()
+        backend = (tg_tts_backend or "minimax").strip().lower()
         if backend == "local-gpt-sovits":
             if tg_tts_gsv_root and tg_tts_ref_audio_path:
                 try:
@@ -3014,6 +3594,11 @@ def build_service() -> TgCodexService:
                     tts_backend_label = f"local-gpt-sovits-unavailable:{e}"
             else:
                 tts_backend_label = "local-gpt-sovits-missing-root-or-ref"
+        elif backend == "minimax":
+            tts_backend_label = (
+                f"minimax:{tg_tts_api_base} "
+                f"model={tg_tts_model_default or DEFAULT_MINIMAX_MODEL} mode={tg_tts_mode or 'auto'}"
+            )
         else:
             tts_backend_label = f"unsupported-backend:{backend}"
     if codex_dangerous_bypass_level == 1:
@@ -3064,7 +3649,7 @@ def build_service() -> TgCodexService:
         log(f"[warn] Telegram voice transcription requested, but backend is unavailable ({voice_backend_label})")
     else:
         log("[info] Telegram voice transcription disabled")
-    if tg_tts_enabled and tts_synthesizer is not None:
+    if tg_tts_enabled and (tts_synthesizer is not None or (tg_tts_backend or "").strip().lower() == "minimax"):
         log(f"[info] Telegram TTS enabled (backend: {tts_backend_label})")
     elif tg_tts_enabled:
         log(f"[warn] Telegram TTS requested, but backend is unavailable ({tts_backend_label})")
@@ -3097,8 +3682,13 @@ def build_service() -> TgCodexService:
         memory_context_prompt=tg_memory_context_prompt,
         memory_writeback_prompt=tg_memory_writeback_prompt,
         memory_auto_enabled=memory_auto_enabled,
+        tts_backend=tg_tts_backend,
         tts_mode=tg_tts_mode,
         tts_max_chars=tg_tts_max_chars,
+        tts_api_base=tg_tts_api_base,
+        tts_default_model=tg_tts_model_default,
+        tts_ffmpeg_bin=tg_tts_ffmpeg_bin,
+        tts_cache_dir=tg_tts_cache_dir,
     )
 
 

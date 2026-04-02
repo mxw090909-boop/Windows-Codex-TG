@@ -531,6 +531,13 @@ class BotState:
             users[key] = {}
         return users[key]
 
+    @staticmethod
+    def _normalize_voice_setting(value: Any, *, limit: int = 400) -> Optional[str]:
+        text = " ".join(str(value or "").split()).strip()
+        if not text:
+            return None
+        return text[:limit]
+
     def set_active_session(self, user_id: StateActor, session_id: str, cwd: str) -> None:
         with self._lock:
             user_data = self._get_user_unlocked(user_id)
@@ -707,6 +714,129 @@ class BotState:
             user_data["active_cwd"] = cwd
             self._save_unlocked()
             return True
+
+    def get_voice_settings(self, user_id: StateActor) -> Dict[str, Any]:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            voice = user_data.get("voice")
+            if not isinstance(voice, dict):
+                return {}
+            return copy.deepcopy(voice)
+
+    def update_voice_settings(
+        self,
+        user_id: StateActor,
+        *,
+        api_key: Any = None,
+        voice_id: Any = None,
+        model: Any = None,
+        frequency: Any = None,
+        clear: bool = False,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            if clear:
+                user_data.pop("voice", None)
+                self._save_unlocked()
+                return {}
+
+            voice = user_data.setdefault("voice", {})
+            if not isinstance(voice, dict):
+                voice = {}
+                user_data["voice"] = voice
+
+            normalized_api_key = self._normalize_voice_setting(api_key, limit=800)
+            normalized_voice_id = self._normalize_voice_setting(voice_id, limit=120)
+            normalized_model = self._normalize_voice_setting(model, limit=120)
+            normalized_frequency = self._normalize_voice_setting(frequency, limit=32)
+
+            if api_key is not None:
+                if normalized_api_key is None:
+                    voice.pop("api_key", None)
+                else:
+                    voice["api_key"] = normalized_api_key
+            if voice_id is not None:
+                if normalized_voice_id is None:
+                    voice.pop("voice_id", None)
+                else:
+                    voice["voice_id"] = normalized_voice_id
+            if model is not None:
+                if normalized_model is None:
+                    voice.pop("model", None)
+                else:
+                    voice["model"] = normalized_model
+            if frequency is not None:
+                if normalized_frequency is None:
+                    voice.pop("frequency", None)
+                else:
+                    voice["frequency"] = normalized_frequency
+
+            voice["updated_at"] = int(time.time())
+            self._save_unlocked()
+            return copy.deepcopy(voice)
+
+    def create_tts_request(
+        self,
+        user_id: StateActor,
+        *,
+        text: str,
+        voice_id: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> Optional[str]:
+        normalized_text = self._normalize_voice_setting(text, limit=5000)
+        if not normalized_text:
+            return None
+        timestamp = int(time.time())
+        token = uuid.uuid4().hex[:10]
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            voice = user_data.setdefault("voice", {})
+            if not isinstance(voice, dict):
+                voice = {}
+                user_data["voice"] = voice
+            pending = voice.setdefault("pending_tts_requests", {})
+            if not isinstance(pending, dict):
+                pending = {}
+                voice["pending_tts_requests"] = pending
+
+            stale_before = timestamp - 7 * 86400
+            for existing_token in list(pending.keys()):
+                item = pending.get(existing_token)
+                created_at = int(item.get("created_at") or 0) if isinstance(item, dict) else 0
+                if created_at < stale_before:
+                    pending.pop(existing_token, None)
+            while len(pending) >= 40:
+                oldest_token = min(
+                    pending,
+                    key=lambda key: int((pending.get(key) or {}).get("created_at") or 0),
+                )
+                pending.pop(oldest_token, None)
+
+            pending[token] = {
+                "text": normalized_text,
+                "voice_id": self._normalize_voice_setting(voice_id, limit=120),
+                "model": self._normalize_voice_setting(model, limit=120),
+                "created_at": timestamp,
+            }
+            self._save_unlocked()
+            return token
+
+    def get_tts_request(self, user_id: StateActor, token: str) -> Optional[Dict[str, Any]]:
+        target = self._normalize_voice_setting(token, limit=64)
+        if not target:
+            return None
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            voice = user_data.get("voice")
+            if not isinstance(voice, dict):
+                return None
+            pending = voice.get("pending_tts_requests")
+            if not isinstance(pending, dict):
+                return None
+            item = pending.get(target)
+            if not isinstance(item, dict):
+                return None
+            return copy.deepcopy(item)
 
 
 class RunningPromptRegistry:

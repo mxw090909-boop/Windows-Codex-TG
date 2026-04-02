@@ -33,7 +33,7 @@ class FakeTelegramAPI:
         self.sent.append((chat_id, text, reply_to, reply_markup))
         return {"message_id": len(self.sent)}
 
-    def edit_message_text(self, chat_id, message_id, text):
+    def edit_message_text(self, chat_id, message_id, text, reply_markup=None):
         return None
 
     def send_chat_action(self, chat_id, action="typing"):

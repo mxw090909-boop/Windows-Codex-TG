@@ -17,6 +17,10 @@ BOT_SCRIPT = SCRIPT_DIR / "tg_codex_bot.py"
 PID_FILE = RUNTIME_DIR / "bot.pid"
 STDOUT_LOG = RUNTIME_DIR / "bot.out.log"
 STDERR_LOG = RUNTIME_DIR / "bot.err.log"
+KEEP_AWAKE_SCRIPT = SCRIPT_DIR / "keep_awake.py"
+KEEP_AWAKE_PID_FILE = RUNTIME_DIR / "keep_awake.pid"
+KEEP_AWAKE_STDOUT_LOG = RUNTIME_DIR / "keep_awake.out.log"
+KEEP_AWAKE_STDERR_LOG = RUNTIME_DIR / "keep_awake.err.log"
 STATE_PATH = RUNTIME_DIR / "bot_state.json"
 LOCAL_ENV_PATH = SCRIPT_DIR / "telegram.local.env"
 LOCAL_CODEX_DIR = RUNTIME_DIR / "codex-bin"
@@ -59,6 +63,20 @@ def fail(message: str) -> None:
 
 def ensure_runtime_dir() -> None:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def read_pid_file(path: Path) -> Optional[int]:
+    if not path.exists():
+        return None
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        path.unlink(missing_ok=True)
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        path.unlink(missing_ok=True)
+        return None
 
 
 def load_local_env(path: Path) -> Dict[str, str]:
@@ -156,17 +174,7 @@ def resolve_session_root() -> Path:
 
 
 def read_pid() -> Optional[int]:
-    if not PID_FILE.exists():
-        return None
-    raw = PID_FILE.read_text(encoding="utf-8").strip()
-    if not raw:
-        PID_FILE.unlink(missing_ok=True)
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        PID_FILE.unlink(missing_ok=True)
-        return None
+    return read_pid_file(PID_FILE)
 
 
 def is_process_running(pid: int) -> bool:
@@ -188,13 +196,21 @@ def is_process_running(pid: int) -> bool:
 
 
 def get_running_pid() -> Optional[int]:
-    pid = read_pid()
+    return get_running_pid_for(PID_FILE)
+
+
+def get_running_pid_for(pid_file: Path) -> Optional[int]:
+    pid = read_pid_file(pid_file)
     if pid is None:
         return None
     if is_process_running(pid):
         return pid
-    PID_FILE.unlink(missing_ok=True)
+    pid_file.unlink(missing_ok=True)
     return None
+
+
+def get_keep_awake_pid() -> Optional[int]:
+    return get_running_pid_for(KEEP_AWAKE_PID_FILE)
 
 
 def tail_lines(path: Path, limit: int = 40) -> str:
@@ -206,7 +222,7 @@ def tail_lines(path: Path, limit: int = 40) -> str:
 
 def show_recent_logs() -> None:
     seen_any = False
-    for path in (STDOUT_LOG, STDERR_LOG):
+    for path in (STDOUT_LOG, STDERR_LOG, KEEP_AWAKE_STDOUT_LOG, KEEP_AWAKE_STDERR_LOG):
         if not path.exists():
             continue
         content = tail_lines(path)
@@ -315,33 +331,39 @@ def validate_start_config() -> Dict[str, str]:
         "OPENAI_API_KEY": env_value("OPENAI_API_KEY"),
         "OPENAI_BASE_URL": env_value("OPENAI_BASE_URL"),
     }
+    passthrough_prefixes = ("TG_", "OPENAI_", "TELEGRAM_", "MEMORY_")
+    for key in LOCAL_ENV.keys():
+        if key in config:
+            continue
+        if not key.startswith(passthrough_prefixes):
+            continue
+        value = env_value(key)
+        if value:
+            config[key] = value
     return configure_tg_voice_defaults(config)
 
 
-def start_bot() -> None:
-    ensure_runtime_dir()
+def is_keep_awake_enabled() -> bool:
+    return env_value("KEEP_AWAKE_ENABLED", "1") != "0"
 
-    running_pid = get_running_pid()
-    if running_pid is not None:
-        info(f"Telegram bot 已经在跑了，PID={running_pid}")
-        return
 
-    child_env = os.environ.copy()
-    child_env.update(validate_start_config())
-    child_env["PYTHONUTF8"] = "1"
+def launch_detached_process(
+    args: list[str],
+    env: Dict[str, str],
+    stdout_path: Path,
+    stderr_path: Path,
+) -> subprocess.Popen:
+    stdout_path.touch()
+    stderr_path.touch()
 
-    STDOUT_LOG.touch()
-    STDERR_LOG.touch()
-
-    stdout_handle = STDOUT_LOG.open("a", encoding="utf-8")
-    stderr_handle = STDERR_LOG.open("a", encoding="utf-8")
+    stdout_handle = stdout_path.open("a", encoding="utf-8")
+    stderr_handle = stderr_path.open("a", encoding="utf-8")
 
     try:
-        info("正在启动 Telegram bot...")
-        process = subprocess.Popen(
-            [sys.executable, "-u", str(BOT_SCRIPT)],
+        return subprocess.Popen(
+            args,
             cwd=str(SCRIPT_DIR),
-            env=child_env,
+            env=env,
             stdin=subprocess.DEVNULL,
             stdout=stdout_handle,
             stderr=stderr_handle,
@@ -352,11 +374,93 @@ def start_bot() -> None:
         stdout_handle.close()
         stderr_handle.close()
 
+
+def stop_process(pid_file: Path, label: str) -> Optional[int]:
+    running_pid = get_running_pid_for(pid_file)
+    if running_pid is None:
+        return None
+
+    subprocess.run(["taskkill", "/PID", str(running_pid), "/T", "/F"], capture_output=True, text=True)
+    pid_file.unlink(missing_ok=True)
+    ok(f"{label} 已停止，PID={running_pid}")
+    return running_pid
+
+
+def start_keep_awake() -> Optional[int]:
+    ensure_runtime_dir()
+
+    if not is_keep_awake_enabled():
+        info("keep-awake helper 已禁用（KEEP_AWAKE_ENABLED=0）。")
+        return None
+
+    running_pid = get_keep_awake_pid()
+    if running_pid is not None:
+        info(f"keep-awake helper 已经在跑了，PID={running_pid}")
+        return running_pid
+
+    if not KEEP_AWAKE_SCRIPT.exists():
+        fail(f"找不到 keep_awake.py: {KEEP_AWAKE_SCRIPT}")
+
+    child_env = os.environ.copy()
+    child_env["PYTHONUTF8"] = "1"
+
+    info("正在启动 keep-awake helper...")
+    process = launch_detached_process(
+        [sys.executable, "-u", str(KEEP_AWAKE_SCRIPT)],
+        child_env,
+        KEEP_AWAKE_STDOUT_LOG,
+        KEEP_AWAKE_STDERR_LOG,
+    )
+
+    KEEP_AWAKE_PID_FILE.write_text(str(process.pid), encoding="utf-8")
+    time.sleep(1)
+
+    started_pid = get_keep_awake_pid()
+    if started_pid is not None:
+        ok(f"keep-awake helper 已启动，PID={started_pid}")
+        return started_pid
+
+    KEEP_AWAKE_PID_FILE.unlink(missing_ok=True)
+    fail("keep-awake helper 启动后立刻退出了。")
+
+
+def stop_keep_awake(quiet_if_missing: bool = False) -> None:
+    stopped_pid = stop_process(KEEP_AWAKE_PID_FILE, "keep-awake helper")
+    if stopped_pid is None and not quiet_if_missing:
+        info("keep-awake helper 没在运行。")
+
+
+def start_bot() -> None:
+    ensure_runtime_dir()
+
+    running_pid = get_running_pid()
+    if running_pid is not None:
+        info(f"Telegram bot 已经在跑了，PID={running_pid}")
+        start_keep_awake()
+        return
+
+    child_env = os.environ.copy()
+    child_env.update(validate_start_config())
+    child_env["PYTHONUTF8"] = "1"
+
+    info("正在启动 Telegram bot...")
+    process = launch_detached_process(
+        [sys.executable, "-u", str(BOT_SCRIPT)],
+        child_env,
+        STDOUT_LOG,
+        STDERR_LOG,
+    )
+
     PID_FILE.write_text(str(process.pid), encoding="utf-8")
     time.sleep(2)
 
     started_pid = get_running_pid()
     if started_pid is not None:
+        try:
+            start_keep_awake()
+        except SystemExit:
+            stop_process(PID_FILE, "Telegram bot")
+            raise
         ok(f"Telegram bot 已启动，PID={started_pid}")
         ok(f"stdout: {STDOUT_LOG}")
         ok(f"stderr: {STDERR_LOG}")
@@ -368,24 +472,41 @@ def start_bot() -> None:
 
 def stop_bot() -> None:
     running_pid = get_running_pid()
-    if running_pid is None:
+    keep_awake_pid = get_keep_awake_pid()
+    if running_pid is None and keep_awake_pid is None:
         info("Telegram bot 没在运行。")
         return
 
-    subprocess.run(["taskkill", "/PID", str(running_pid), "/T", "/F"], capture_output=True, text=True)
-    PID_FILE.unlink(missing_ok=True)
-    ok(f"Telegram bot 已停止，PID={running_pid}")
+    if running_pid is not None:
+        stop_process(PID_FILE, "Telegram bot")
+    else:
+        info("Telegram bot 没在运行。")
+
+    if keep_awake_pid is not None:
+        stop_keep_awake(quiet_if_missing=True)
+    else:
+        info("keep-awake helper 没在运行。")
 
 
 def show_status() -> None:
     running_pid = get_running_pid()
+    keep_awake_pid = get_keep_awake_pid()
+
     if running_pid is None:
         info("Telegram bot 没在运行。")
-        return
+    else:
+        ok(f"Telegram bot 运行中，PID={running_pid}")
+        info(f"stdout: {STDOUT_LOG}")
+        info(f"stderr: {STDERR_LOG}")
 
-    ok(f"Telegram bot 运行中，PID={running_pid}")
-    info(f"stdout: {STDOUT_LOG}")
-    info(f"stderr: {STDERR_LOG}")
+    if not is_keep_awake_enabled():
+        info("keep-awake helper 已禁用（KEEP_AWAKE_ENABLED=0）。")
+    elif keep_awake_pid is None:
+        warn("keep-awake helper 没在运行。")
+    else:
+        ok(f"keep-awake helper 运行中，PID={keep_awake_pid}")
+        info(f"stdout: {KEEP_AWAKE_STDOUT_LOG}")
+        info(f"stderr: {KEEP_AWAKE_STDERR_LOG}")
 
 
 def follow_logs(paths: Iterable[Path]) -> None:
@@ -426,8 +547,10 @@ def show_logs() -> None:
     ensure_runtime_dir()
     STDOUT_LOG.touch()
     STDERR_LOG.touch()
+    KEEP_AWAKE_STDOUT_LOG.touch()
+    KEEP_AWAKE_STDERR_LOG.touch()
     show_recent_logs()
-    follow_logs((STDOUT_LOG, STDERR_LOG))
+    follow_logs((STDOUT_LOG, STDERR_LOG, KEEP_AWAKE_STDOUT_LOG, KEEP_AWAKE_STDERR_LOG))
 
 
 def show_help() -> None:
@@ -439,6 +562,8 @@ def show_help() -> None:
     print(r"  .\run.ps1 status")
     print(r"  .\run.ps1 logs")
     print(r"  .\run.ps1 restart")
+    print()
+    print("Start 会顺手拉起 keep_awake.py；想关掉可设 KEEP_AWAKE_ENABLED=0。")
     print()
     print("Before start:")
     print("  1. Fill telegram.local.env")

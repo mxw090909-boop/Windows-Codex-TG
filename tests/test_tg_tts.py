@@ -2,7 +2,13 @@ import shutil
 import unittest
 from pathlib import Path
 
-from tg_tts import LocalGptSovitsTtsSynthesizer, derive_prompt_text_from_reference, is_tts_reply_candidate
+from tg_tts import (
+    DEFAULT_MINIMAX_MODEL,
+    LocalGptSovitsTtsSynthesizer,
+    MiniMaxTtsSynthesizer,
+    derive_prompt_text_from_reference,
+    is_tts_reply_candidate,
+)
 
 
 def make_test_root(name: str) -> Path:
@@ -21,10 +27,10 @@ class TelegramTtsHelpersTests(unittest.TestCase):
 
     def test_auto_mode_skips_code_like_replies(self) -> None:
         self.assertFalse(is_tts_reply_candidate("```python\nprint('hi')\n```", mode="auto", max_chars=220))
-        self.assertFalse(is_tts_reply_candidate("路径在 C:\\repo\\app.py", mode="auto", max_chars=220))
+        self.assertFalse(is_tts_reply_candidate("文件在 C:\\repo\\app.py", mode="auto", max_chars=220))
 
     def test_auto_mode_accepts_short_spoken_reply(self) -> None:
-        self.assertTrue(is_tts_reply_candidate("我在呢，宝宝。你先抱我一下。", mode="auto", max_chars=220))
+        self.assertTrue(is_tts_reply_candidate("我在呀，刚刚已经帮你弄好了。", mode="auto", max_chars=220))
 
     def test_relative_paths_resolve_against_root(self) -> None:
         root = make_test_root("tts_relative_paths")
@@ -36,7 +42,7 @@ class TelegramTtsHelpersTests(unittest.TestCase):
         (root / "GPT_weights").mkdir(parents=True, exist_ok=True)
         (root / "SoVITS_weights").mkdir(parents=True, exist_ok=True)
         (root / "reference_audios").mkdir(parents=True, exist_ok=True)
-        ref_audio = root / "reference_audios" / "【默认】你好呀。.wav"
+        ref_audio = root / "reference_audios" / "【默认】陪你说话.wav"
         ref_audio.write_bytes(b"wav")
         gpt_weights = root / "GPT_weights" / "Cove.ckpt"
         gpt_weights.write_bytes(b"gpt")
@@ -45,7 +51,7 @@ class TelegramTtsHelpersTests(unittest.TestCase):
 
         synth = LocalGptSovitsTtsSynthesizer(
             root_dir=str(root),
-            ref_audio_path="reference_audios/【默认】你好呀。.wav",
+            ref_audio_path="reference_audios/【默认】陪你说话.wav",
             gpt_weights_path="GPT_weights/Cove.ckpt",
             sovits_weights_path="SoVITS_weights/Cove.pth",
             ffmpeg_bin=str(root / "ffmpeg.exe"),
@@ -54,7 +60,31 @@ class TelegramTtsHelpersTests(unittest.TestCase):
         self.assertEqual(synth.ref_audio_path, ref_audio.resolve())
         self.assertEqual(synth.gpt_weights_path, gpt_weights.resolve())
         self.assertEqual(synth.sovits_weights_path, sovits_weights.resolve())
-        self.assertEqual(synth.prompt_text, "你好呀。")
+        self.assertEqual(synth.prompt_text, "陪你说话")
+
+    def test_minimax_cache_path_uses_voice_and_model(self) -> None:
+        root = make_test_root("tts_minimax_cache")
+        ffmpeg_bin = root / "ffmpeg.exe"
+        ffmpeg_bin.write_bytes(b"")
+        synth = MiniMaxTtsSynthesizer(
+            api_key="secret",
+            voice_id="male-qn-qingse",
+            ffmpeg_bin=str(ffmpeg_bin),
+            cache_dir=root / "cache",
+        )
+        first = synth._cache_path("你好呀")
+        second = synth._cache_path("你好呀")
+        third = MiniMaxTtsSynthesizer(
+            api_key="secret",
+            voice_id="female-yujie",
+            ffmpeg_bin=str(ffmpeg_bin),
+            cache_dir=root / "cache",
+            model=DEFAULT_MINIMAX_MODEL,
+        )._cache_path("你好呀")
+
+        self.assertIsNotNone(first)
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, third)
 
 
 if __name__ == "__main__":

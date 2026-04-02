@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -18,6 +19,9 @@ from codex_common import log
 
 DEFAULT_TTS_API_BASE = "http://127.0.0.1:9880"
 DEFAULT_TTS_MAX_CHARS = 220
+DEFAULT_MINIMAX_API_BASE = "https://api.minimaxi.com/v1"
+DEFAULT_MINIMAX_MODEL = "speech-2.8-turbo"
+DEFAULT_MINIMAX_LANGUAGE_BOOST = "Chinese"
 
 
 @dataclass
@@ -56,7 +60,6 @@ def is_tts_reply_candidate(text: str, *, mode: str = "auto", max_chars: int = DE
         "```",
         "stderr:",
         "Traceback",
-        "Codex 执行失败",
         "/memory",
         "/use ",
         "/sessions",
@@ -73,6 +76,69 @@ def is_tts_reply_candidate(text: str, *, mode: str = "auto", max_chars: int = DE
     if len([line for line in (text or "").splitlines() if line.strip()]) > 4:
         return False
     return True
+
+
+def resolve_ffmpeg_bin(explicit_ffmpeg_bin: Optional[str] = None) -> Optional[str]:
+    if explicit_ffmpeg_bin:
+        explicit = Path(explicit_ffmpeg_bin).expanduser()
+        if explicit.exists():
+            return str(explicit.resolve())
+
+    discovered = shutil.which("ffmpeg")
+    if discovered:
+        return discovered
+
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def convert_audio_bytes_to_voice_note(
+    audio_bytes: bytes,
+    *,
+    input_suffix: str,
+    ffmpeg_bin: str,
+    temp_dir: Optional[Path] = None,
+) -> bytes:
+    target_dir = temp_dir or Path(tempfile.gettempdir())
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    fd_in, input_path = tempfile.mkstemp(prefix="tg-tts-", suffix=input_suffix, dir=target_dir)
+    os.close(fd_in)
+    fd_out, output_path = tempfile.mkstemp(prefix="tg-tts-", suffix=".ogg", dir=target_dir)
+    os.close(fd_out)
+
+    try:
+        Path(input_path).write_bytes(audio_bytes)
+        cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-i",
+            input_path,
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "48k",
+            "-vbr",
+            "on",
+            "-application",
+            "voip",
+            output_path,
+        ]
+        completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if completed.returncode != 0:
+            stderr_tail = (completed.stderr or "").strip()[-1200:]
+            raise RuntimeError(f"ffmpeg 转 Telegram 语音失败: {stderr_tail}")
+        return Path(output_path).read_bytes()
+    finally:
+        for tmp_path in (input_path, output_path):
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 class LocalGptSovitsTtsSynthesizer:
@@ -109,7 +175,7 @@ class LocalGptSovitsTtsSynthesizer:
             self._resolve_path(sovits_weights_path, must_exist=True) if sovits_weights_path else None
         )
         self.python_bin = self._resolve_python_bin(python_bin)
-        self.ffmpeg_bin = self._resolve_ffmpeg_bin(ffmpeg_bin)
+        self.ffmpeg_bin = resolve_ffmpeg_bin(ffmpeg_bin)
         self.tts_config_path = self._resolve_path(tts_config_path, must_exist=True) if tts_config_path else None
         self.startup_timeout_sec = max(30, int(startup_timeout_sec))
         self.request_timeout_sec = max(30, int(request_timeout_sec))
@@ -123,7 +189,7 @@ class LocalGptSovitsTtsSynthesizer:
 
     def validate_environment(self) -> None:
         if not self.root_dir.exists():
-            raise RuntimeError(f"GPT-SoVITS 根目录不存在: {self.root_dir}")
+            raise RuntimeError(f"GPT-SoVITS 目录不存在: {self.root_dir}")
         if not (self.root_dir / "api_v2.py").exists():
             raise RuntimeError(f"未找到 api_v2.py: {self.root_dir}")
         if not self.ref_audio_path.exists():
@@ -133,21 +199,21 @@ class LocalGptSovitsTtsSynthesizer:
         if self.sovits_weights_path is not None and not self.sovits_weights_path.exists():
             raise RuntimeError(f"SoVITS 权重不存在: {self.sovits_weights_path}")
         if not self.python_bin or not Path(self.python_bin).exists():
-            raise RuntimeError("未找到可用的 GPT-SoVITS Python 解释器。")
+            raise RuntimeError("未找到 GPT-SoVITS 可用的 Python。")
         if not self.ffmpeg_bin:
-            raise RuntimeError("未找到 ffmpeg，可安装系统 ffmpeg 或配置 TG_TTS_FFMPEG_BIN。")
+            raise RuntimeError("未找到 ffmpeg。")
 
     def synthesize_voice_note(self, text: str) -> SynthesizedVoiceNote:
         cleaned = re.sub(r"\s+", " ", (text or "").strip())
         if not cleaned:
-            raise RuntimeError("语音内容为空。")
+            raise RuntimeError("要合成的文本是空的。")
         if len(cleaned) > self.max_chars:
-            raise RuntimeError(f"语音内容过长（{len(cleaned)} chars），超过当前限制 {self.max_chars}。")
+            raise RuntimeError(f"文本太长（{len(cleaned)} chars），超过当前上限 {self.max_chars}。")
 
         with self._synthesis_lock:
             self._ensure_server_ready()
             self._ensure_weights_applied()
-            wav_bytes, content_type = self._request_audio(
+            wav_bytes, _ = self._request_audio(
                 "/tts",
                 {
                     "text": cleaned,
@@ -164,13 +230,14 @@ class LocalGptSovitsTtsSynthesizer:
                 },
             )
             if not wav_bytes:
-                raise RuntimeError("GPT-SoVITS 返回了空音频。")
-            voice_bytes = self._convert_wav_to_voice_note(wav_bytes)
-            return SynthesizedVoiceNote(
-                audio_bytes=voice_bytes,
-                file_name="reply.ogg",
-                mime_type="audio/ogg",
+                raise RuntimeError("GPT-SoVITS 没有返回音频数据。")
+            voice_bytes = convert_audio_bytes_to_voice_note(
+                wav_bytes,
+                input_suffix=".wav",
+                ffmpeg_bin=self.ffmpeg_bin,
+                temp_dir=self.root_dir / "TEMP",
             )
+            return SynthesizedVoiceNote(audio_bytes=voice_bytes)
 
     def _resolve_path(self, raw_path: str, *, must_exist: bool) -> Path:
         candidate = Path(raw_path).expanduser()
@@ -197,23 +264,6 @@ class LocalGptSovitsTtsSynthesizer:
                 return str(candidate.resolve())
         return None
 
-    def _resolve_ffmpeg_bin(self, explicit_ffmpeg_bin: Optional[str]) -> Optional[str]:
-        if explicit_ffmpeg_bin:
-            explicit = Path(explicit_ffmpeg_bin).expanduser()
-            if explicit.exists():
-                return str(explicit.resolve())
-
-        discovered = shutil.which("ffmpeg")
-        if discovered:
-            return discovered
-
-        try:
-            import imageio_ffmpeg
-
-            return imageio_ffmpeg.get_ffmpeg_exe()
-        except Exception:
-            return None
-
     def _ensure_server_ready(self) -> None:
         if self._is_server_ready():
             return
@@ -221,7 +271,6 @@ class LocalGptSovitsTtsSynthesizer:
         with self._server_lock:
             if self._is_server_ready():
                 return
-
             if self._api_process is None or self._api_process.poll() is not None:
                 self._start_api_process()
 
@@ -230,10 +279,10 @@ class LocalGptSovitsTtsSynthesizer:
                 if self._is_server_ready():
                     return
                 if self._api_process is not None and self._api_process.poll() is not None:
-                    raise RuntimeError(f"GPT-SoVITS API 提前退出了。\n{self._read_process_log_tail()}")
+                    raise RuntimeError(f"GPT-SoVITS API 提前退出。\n{self._read_process_log_tail()}")
                 time.sleep(1.0)
 
-            raise RuntimeError(f"等待 GPT-SoVITS API 启动超时。\n{self._read_process_log_tail()}")
+            raise RuntimeError(f"等待 GPT-SoVITS API 超时。\n{self._read_process_log_tail()}")
 
     def _start_api_process(self) -> None:
         temp_dir = self.root_dir / "TEMP"
@@ -247,14 +296,7 @@ class LocalGptSovitsTtsSynthesizer:
             self._process_log_handle = None
 
         self._process_log_handle = open(log_path, "ab")
-        args = [
-            self.python_bin,
-            "api_v2.py",
-            "-a",
-            self.api_host,
-            "-p",
-            str(self.api_port),
-        ]
+        args = [self.python_bin, "api_v2.py", "-a", self.api_host, "-p", str(self.api_port)]
         if self.tts_config_path is not None:
             args.extend(["-c", str(self.tts_config_path)])
 
@@ -267,15 +309,12 @@ class LocalGptSovitsTtsSynthesizer:
             creationflags=creationflags,
         )
         self._weights_applied = False
-        log(
-            "started GPT-SoVITS API: "
-            f"pid={self._api_process.pid} host={self.api_host} port={self.api_port}"
-        )
+        log(f"started GPT-SoVITS API: pid={self._api_process.pid} host={self.api_host} port={self.api_port}")
 
     def _read_process_log_tail(self, max_chars: int = 1600) -> str:
         log_path = self.root_dir / "TEMP" / "tg-gsv-api.log"
         if not log_path.exists():
-            return "未找到 GPT-SoVITS API 日志。"
+            return "还没有 GPT-SoVITS API 日志。"
         raw = log_path.read_text(encoding="utf-8", errors="ignore")
         return raw[-max_chars:].strip() or "GPT-SoVITS API 日志为空。"
 
@@ -292,10 +331,7 @@ class LocalGptSovitsTtsSynthesizer:
             return
 
         if self.gpt_weights_path is not None:
-            self._request_text(
-                "/set_gpt_weights",
-                query={"weights_path": self._path_for_api(self.gpt_weights_path)},
-            )
+            self._request_text("/set_gpt_weights", query={"weights_path": self._path_for_api(self.gpt_weights_path)})
         if self.sovits_weights_path is not None:
             self._request_text(
                 "/set_sovits_weights",
@@ -327,51 +363,145 @@ class LocalGptSovitsTtsSynthesizer:
         )
         try:
             with urllib.request.urlopen(req, timeout=self.request_timeout_sec) as resp:
-                content_type = resp.headers.get("Content-Type", "")
-                return resp.read(), content_type
+                return resp.read(), resp.headers.get("Content-Type", "")
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="ignore")
             raise RuntimeError(f"GPT-SoVITS TTS 请求失败: {body or e}") from e
 
-    def _convert_wav_to_voice_note(self, wav_bytes: bytes) -> bytes:
-        temp_dir = self.root_dir / "TEMP"
-        temp_dir.mkdir(parents=True, exist_ok=True)
 
-        fd_in, input_path = tempfile.mkstemp(prefix="tg-tts-", suffix=".wav", dir=temp_dir)
-        os.close(fd_in)
-        fd_out, output_path = tempfile.mkstemp(prefix="tg-tts-", suffix=".ogg", dir=temp_dir)
-        os.close(fd_out)
+class MiniMaxTtsSynthesizer:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        voice_id: str,
+        api_base: str = DEFAULT_MINIMAX_API_BASE,
+        model: str = DEFAULT_MINIMAX_MODEL,
+        ffmpeg_bin: Optional[str] = None,
+        cache_dir: Optional[Path] = None,
+        request_timeout_sec: int = 120,
+        max_chars: int = DEFAULT_TTS_MAX_CHARS,
+        language_boost: Optional[str] = DEFAULT_MINIMAX_LANGUAGE_BOOST,
+        speed: float = 1.0,
+        vol: float = 1.0,
+        pitch: int = 0,
+    ) -> None:
+        self.api_key = (api_key or "").strip()
+        self.voice_id = (voice_id or "").strip()
+        self.api_base = (api_base or DEFAULT_MINIMAX_API_BASE).rstrip("/")
+        self.model = (model or DEFAULT_MINIMAX_MODEL).strip()
+        self.ffmpeg_bin = resolve_ffmpeg_bin(ffmpeg_bin)
+        self.cache_dir = Path(cache_dir).expanduser().resolve() if cache_dir else None
+        self.request_timeout_sec = max(30, int(request_timeout_sec))
+        self.max_chars = max(40, int(max_chars))
+        self.language_boost = (language_boost or "").strip() or None
+        self.speed = max(0.5, min(float(speed), 2.0))
+        self.vol = max(0.1, min(float(vol), 10.0))
+        self.pitch = max(-12, min(int(pitch), 12))
+        self._lock = threading.Lock()
+
+    def validate_environment(self) -> None:
+        if not self.api_key:
+            raise RuntimeError("MiniMax API key 为空。")
+        if not self.voice_id:
+            raise RuntimeError("MiniMax voice_id 为空。")
+        if not self.ffmpeg_bin:
+            raise RuntimeError("未找到 ffmpeg。")
+        if self.cache_dir is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def synthesize_voice_note(self, text: str) -> SynthesizedVoiceNote:
+        cleaned = re.sub(r"\s+", " ", (text or "").strip())
+        if not cleaned:
+            raise RuntimeError("要合成的文本是空的。")
+        if len(cleaned) > self.max_chars:
+            raise RuntimeError(f"文本太长（{len(cleaned)} chars），超过当前上限 {self.max_chars}。")
+
+        with self._lock:
+            cache_path = self._cache_path(cleaned)
+            if cache_path is not None and cache_path.exists():
+                return SynthesizedVoiceNote(audio_bytes=cache_path.read_bytes())
+
+            mp3_bytes = self._request_mp3(cleaned)
+            voice_bytes = convert_audio_bytes_to_voice_note(
+                mp3_bytes,
+                input_suffix=".mp3",
+                ffmpeg_bin=self.ffmpeg_bin,
+                temp_dir=self.cache_dir,
+            )
+            if cache_path is not None:
+                cache_path.write_bytes(voice_bytes)
+            return SynthesizedVoiceNote(audio_bytes=voice_bytes)
+
+    def _cache_path(self, text: str) -> Optional[Path]:
+        if self.cache_dir is None:
+            return None
+        digest = hashlib.sha256(
+            f"{self.api_base}|{self.model}|{self.voice_id}|{self.speed}|{self.vol}|{self.pitch}|{text}".encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        return self.cache_dir / f"{digest}.ogg"
+
+    def _request_mp3(self, text: str) -> bytes:
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "text": text,
+            "stream": False,
+            "voice_setting": {
+                "voice_id": self.voice_id,
+                "speed": self.speed,
+                "vol": self.vol,
+                "pitch": self.pitch,
+            },
+            "audio_setting": {
+                "sample_rate": 32000,
+                "bitrate": 128000,
+                "format": "mp3",
+                "channel": 1,
+            },
+            "output_format": "hex",
+            "subtitle_enable": False,
+        }
+        if self.language_boost:
+            payload["language_boost"] = self.language_boost
+
+        req = urllib.request.Request(
+            url=f"{self.api_base}/t2a_v2",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.request_timeout_sec) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"MiniMax TTS 请求失败: HTTP {e.code} {detail}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"MiniMax TTS 请求失败: {e}") from e
 
         try:
-            Path(input_path).write_bytes(wav_bytes)
-            cmd = [
-                self.ffmpeg_bin,
-                "-y",
-                "-i",
-                input_path,
-                "-c:a",
-                "libopus",
-                "-b:a",
-                "48k",
-                "-vbr",
-                "on",
-                "-application",
-                "voip",
-                output_path,
-            ]
-            completed = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=False,
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise RuntimeError("MiniMax TTS 返回了无法解析的响应。") from e
+
+        base_resp = parsed.get("base_resp") if isinstance(parsed, dict) else None
+        if isinstance(base_resp, dict) and int(base_resp.get("status_code") or 0) != 0:
+            raise RuntimeError(
+                f"MiniMax TTS 请求失败: {base_resp.get('status_msg') or base_resp.get('status_code')}"
             )
-            if completed.returncode != 0:
-                stderr_tail = (completed.stderr or "").strip()[-1200:]
-                raise RuntimeError(f"ffmpeg 转 Telegram 语音失败: {stderr_tail}")
-            return Path(output_path).read_bytes()
-        finally:
-            for tmp_path in (input_path, output_path):
-                try:
-                    Path(tmp_path).unlink(missing_ok=True)
-                except Exception:
-                    pass
+
+        data = parsed.get("data") if isinstance(parsed, dict) else None
+        if not isinstance(data, dict):
+            raise RuntimeError("MiniMax TTS 没有返回 data。")
+        audio_hex = str(data.get("audio") or "").strip()
+        if not audio_hex:
+            raise RuntimeError("MiniMax TTS 没有返回音频内容。")
+        try:
+            return bytes.fromhex(audio_hex)
+        except ValueError as e:
+            raise RuntimeError("MiniMax TTS 返回的音频不是合法 hex。") from e

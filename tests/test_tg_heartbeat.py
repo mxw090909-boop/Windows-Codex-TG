@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import tempfile
 import time
@@ -76,8 +78,8 @@ class RecordingTelegramAPI:
         self.sent.append((chat_id, text, reply_to, reply_markup))
         return {"message_id": len(self.sent)}
 
-    def edit_message_text(self, chat_id, message_id, text):
-        self.edits.append((chat_id, message_id, text))
+    def edit_message_text(self, chat_id, message_id, text, reply_markup=None):
+        self.edits.append((chat_id, message_id, text, reply_markup))
 
     def send_chat_action(self, chat_id, action="typing"):
         return None
