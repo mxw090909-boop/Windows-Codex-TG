@@ -3,11 +3,19 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_PATH="${STATE_PATH:-$SCRIPT_DIR/.runtime/bot_state.json}"
-CODEX_BIN_DEFAULT="/Applications/Codex.app/Contents/Resources/codex"
-CODEX_BIN="${CODEX_BIN:-$CODEX_BIN_DEFAULT}"
+CODEX_BIN="${CODEX_BIN:-}"
 
 TARGET_USER_ID="${TARGET_USER_ID:-}"
 DRY_RUN=0
+
+resolve_codex_bin() {
+  if [[ -n "$CODEX_BIN" ]]; then
+    return 0
+  fi
+  if command -v codex >/dev/null 2>&1; then
+    CODEX_BIN="$(command -v codex)"
+  fi
+}
 
 usage() {
   cat <<'EOF'
@@ -45,13 +53,10 @@ if [[ ! -f "$STATE_PATH" ]]; then
   exit 1
 fi
 
+resolve_codex_bin
 if [[ ! -x "$CODEX_BIN" ]]; then
-  if command -v codex >/dev/null 2>&1; then
-    CODEX_BIN="$(command -v codex)"
-  else
-    echo "[error] 找不到 codex 可执行文件，当前: $CODEX_BIN"
-    exit 1
-  fi
+  echo "[error] 找不到 codex 可执行文件，当前: $CODEX_BIN"
+  exit 1
 fi
 
 line="$(

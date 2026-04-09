@@ -129,7 +129,18 @@ class TelegramAttachmentTests(unittest.TestCase):
         service = self.build_service(make_test_root("attachments_route_photo"))
         captured = {}
 
-        def fake_handle_attachment_message(chat_id, reply_to, user_id, media, caption, kind, message_ts=None):
+        def fake_handle_attachment_message(
+            chat_id,
+            reply_to,
+            user_id,
+            media,
+            caption,
+            kind,
+            message_ts=None,
+            raw_message=None,
+            chat_type="",
+            sender_user=None,
+        ):
             captured["chat_id"] = chat_id
             captured["reply_to"] = reply_to
             captured["user_id"] = user_id

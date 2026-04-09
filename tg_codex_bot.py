@@ -28,6 +28,7 @@ from codex_common import (
     MemoryStore,
     RunningPromptRegistry,
     SessionStore,
+    StateActor,
     chunk_text,
     ensure_stdio_encoding,
     env,
@@ -113,6 +114,20 @@ TTS_AUTO_MIN_SCORE = 4
 NEW_THREAD_PERSONA_PROMPT = ""
 MEMORY_CONTEXT_PROMPT = ""
 MEMORY_WRITEBACK_PROMPT = ""
+GROUP_AUTO_REPLY_PROMPT = ""
+GROUP_AUTO_REPLY_DECISION_PROMPT = """你正在帮一个 Telegram 群聊 bot 做“这句要不要接”的轻判断。
+请基于这条群消息本身、发送者信息、是否在回复 bot、以及给出的群设定，判断 bot 是否应该自然接话。
+
+只输出 JSON，格式只能是：
+{"action":"send"}
+或
+{"action":"skip"}
+
+判断原则：
+- 和 bot 明显相关、在叫 bot、在接 bot 的话、或确实值得 bot 回应时，输出 {"action":"send"}
+- 普通群友闲聊、和 bot 无关、只是在讨论别的人/别的话题时，输出 {"action":"skip"}
+- 拿不准时，默认 skip
+- 不要解释，不要输出 JSON 以外的内容"""
 
 
 def _windows_hidden_subprocess_kwargs() -> Dict[str, Any]:
@@ -232,6 +247,21 @@ def parse_allowed_user_ids(raw: Optional[str]) -> Optional[Set[int]]:
             result.add(int(part))
         except ValueError:
             raise ValueError(f"invalid user id in ALLOWED_TELEGRAM_USER_IDS: {part}")
+    return result
+
+
+def parse_chat_ids(raw: Optional[str], *, env_name: str) -> Set[int]:
+    result: Set[int] = set()
+    if not raw:
+        return result
+    for part in raw.split(","):
+        cleaned = part.strip()
+        if not cleaned:
+            continue
+        try:
+            result.add(int(cleaned))
+        except ValueError:
+            raise ValueError(f"invalid chat id in {env_name}: {cleaned}")
     return result
 
 class TelegramAPI:
@@ -835,6 +865,8 @@ class TgCodexService:
         memory_context_prompt: Optional[str] = MEMORY_CONTEXT_PROMPT,
         memory_writeback_prompt: Optional[str] = MEMORY_WRITEBACK_PROMPT,
         memory_auto_enabled: bool = True,
+        group_auto_reply_chat_ids: Optional[Set[int]] = None,
+        group_auto_reply_prompt: Optional[str] = GROUP_AUTO_REPLY_PROMPT,
         tts_backend: str = "disabled",
         tts_mode: str = "auto",
         tts_max_chars: int = DEFAULT_TTS_MAX_CHARS,
@@ -888,6 +920,10 @@ class TgCodexService:
             MEMORY_WRITEBACK_PROMPT if memory_writeback_prompt is None else str(memory_writeback_prompt)
         ).strip()
         self.memory_auto_enabled = bool(memory_auto_enabled)
+        self.group_auto_reply_chat_ids = {int(chat_id) for chat_id in (group_auto_reply_chat_ids or set())}
+        self.group_auto_reply_prompt = (
+            GROUP_AUTO_REPLY_PROMPT if group_auto_reply_prompt is None else str(group_auto_reply_prompt)
+        ).strip()
         self.tts_backend = (tts_backend or "disabled").strip().lower() or "disabled"
         self.tts_mode = (tts_mode or "auto").strip().lower() or "auto"
         self.tts_max_chars = max(40, int(tts_max_chars))
@@ -940,6 +976,27 @@ class TgCodexService:
         if not self.reply_to_messages:
             return None
         return reply_to
+
+    @staticmethod
+    def _group_actor_id(chat_id: int) -> str:
+        return f"group:{int(chat_id)}"
+
+    def _is_group_auto_reply_chat(self, chat_id: int, chat_type: str) -> bool:
+        if str(chat_type or "").strip().lower() not in {"group", "supergroup"}:
+            return False
+        return int(chat_id) in self.group_auto_reply_chat_ids
+
+    @staticmethod
+    def _sender_display_name(user: Dict[str, Any]) -> str:
+        first = str(user.get("first_name") or "").strip()
+        last = str(user.get("last_name") or "").strip()
+        full = " ".join(part for part in (first, last) if part).strip()
+        if full:
+            return full
+        username = str(user.get("username") or "").strip()
+        if username:
+            return f"@{username}"
+        return "群成员"
 
     def _send_message(
         self,
@@ -1360,14 +1417,14 @@ class TgCodexService:
     def _build_reply_delivery_segments(
         self,
         text: str,
-        user_id: Optional[int],
+        user_id: Optional[StateActor],
         *,
         trigger_hint: str = TTS_TRIGGER_AUTO,
     ) -> List[Tuple[str, bool]]:
         cleaned = (text or "").strip()
         if not cleaned:
             return [("...", False)]
-        if user_id is None or not self._tts_feature_ready_for_user(int(user_id)):
+        if not isinstance(user_id, int) or not self._tts_feature_ready_for_user(int(user_id)):
             return [(cleaned, False)]
 
         units = self._voice_delivery_units(cleaned)
@@ -1598,6 +1655,260 @@ class TgCodexService:
         resolved_ts = int(timestamp if timestamp is not None else time.time())
         return self._tokyo_datetime(resolved_ts).strftime("%Y-%m-%d %H:%M")
 
+    def _build_message_context_timestamp(self, timestamp: Optional[int]) -> str:
+        return json.dumps(
+            {"timestamp": self._format_message_context_time(timestamp)},
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    @staticmethod
+    def _extract_json_object_text(text: str) -> Optional[str]:
+        start = text.find("{")
+        if start < 0:
+            return None
+        depth = 0
+        in_string = False
+        escape = False
+        for idx in range(start, len(text)):
+            ch = text[idx]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : idx + 1]
+        return None
+
+    def _build_group_message_metadata(
+        self,
+        *,
+        chat_id: int,
+        chat_type: str,
+        msg: Optional[Dict[str, Any]],
+        user: Optional[Dict[str, Any]],
+        source_kind: str,
+        text: str = "",
+        caption: str = "",
+        message_ts: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        raw_message = msg or {}
+        raw_user = user or {}
+        reply_to = raw_message.get("reply_to_message") if isinstance(raw_message.get("reply_to_message"), dict) else {}
+        reply_from = reply_to.get("from") if isinstance(reply_to.get("from"), dict) else {}
+        username = str(raw_user.get("username") or "").strip()
+        reply_preview = str(reply_to.get("text") or reply_to.get("caption") or "").strip()
+        return {
+            "timestamp": self._format_message_context_time(message_ts),
+            "chat_id": int(chat_id),
+            "chat_type": str(chat_type or "").strip().lower() or "group",
+            "message_id": self._coerce_int(raw_message.get("message_id")),
+            "source_kind": source_kind,
+            "sender_id": self._coerce_int(raw_user.get("id")),
+            "sender_name": self._sender_display_name(raw_user),
+            "sender_username": f"@{username}" if username else "",
+            "text": (text or "").strip(),
+            "caption": (caption or "").strip(),
+            "reply_to_bot": bool(reply_from.get("is_bot")),
+            "reply_to_name": self._sender_display_name(reply_from) if reply_from else "",
+            "reply_preview": reply_preview[:160],
+        }
+
+    def _build_group_gate_prompt(self, metadata: Dict[str, Any]) -> str:
+        lines = [GROUP_AUTO_REPLY_DECISION_PROMPT]
+        if self.group_auto_reply_prompt:
+            lines.append("这个群的补充规则：")
+            lines.append(self.group_auto_reply_prompt)
+        lines.append("下面是这条群消息的上下文 JSON：")
+        lines.append(json.dumps(metadata, ensure_ascii=False, indent=2))
+        return "\n\n".join(line for line in lines if line)
+
+    def _parse_group_gate_action(self, text: str) -> str:
+        cleaned = self._strip_code_fence(text).strip()
+        if not cleaned:
+            return "skip"
+        obj_text = self._extract_json_object_text(cleaned)
+        if obj_text:
+            try:
+                payload = json.loads(obj_text)
+                if isinstance(payload, dict):
+                    action = str(payload.get("action") or "").strip().lower()
+                    if action in {"send", "skip"}:
+                        return action
+            except Exception:
+                pass
+        compact = " ".join(cleaned.lower().split())
+        if '"action":"send"' in compact or compact == "send":
+            return "send"
+        return "skip"
+
+    def _should_auto_reply_in_group(
+        self,
+        *,
+        chat_id: int,
+        chat_type: str,
+        actor_id: StateActor,
+        msg: Dict[str, Any],
+        user: Dict[str, Any],
+        text: str = "",
+        caption: str = "",
+        source_kind: str = "text",
+        message_ts: Optional[int] = None,
+    ) -> bool:
+        metadata = self._build_group_message_metadata(
+            chat_id=chat_id,
+            chat_type=chat_type,
+            msg=msg,
+            user=user,
+            source_kind=source_kind,
+            text=text,
+            caption=caption,
+            message_ts=message_ts,
+        )
+        active_id, active_cwd = self.state.get_active(actor_id)
+        cwd = Path(active_cwd).expanduser() if active_cwd else self.default_cwd
+        if not cwd.exists():
+            cwd = self.default_cwd
+        prompt = self._build_group_gate_prompt(metadata)
+        try:
+            _, answer, stderr_text, return_code = self.codex.run_prompt(
+                prompt=prompt,
+                cwd=cwd,
+                session_id=None,
+                ephemeral=True,
+            )
+        except Exception as e:
+            log(f"group gate failed: chat_id={chat_id} error={e}")
+            return False
+        if return_code != 0:
+            log(f"group gate exit={return_code} chat_id={chat_id} stderr={stderr_text[-240:]}")
+            return False
+        action = self._parse_group_gate_action(answer or "")
+        log(f"group gate: chat_id={chat_id} actor={actor_id} source={source_kind} action={action}")
+        return action == "send"
+
+    def _decorate_group_text_prompt_with_context(
+        self,
+        *,
+        chat_id: int,
+        chat_type: str,
+        msg: Dict[str, Any],
+        user: Dict[str, Any],
+        text: str,
+        message_ts: Optional[int],
+    ) -> str:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return cleaned
+        metadata = self._build_group_message_metadata(
+            chat_id=chat_id,
+            chat_type=chat_type,
+            msg=msg,
+            user=user,
+            source_kind="text",
+            text=cleaned,
+            message_ts=message_ts,
+        )
+        lines = []
+        if self.attach_time_context:
+            lines.append(self._build_message_context_timestamp(message_ts))
+        lines.append("你现在正在 Telegram 群聊里回复消息，只在群里自然接话，不要把群聊上下文带进私聊。")
+        if self.group_auto_reply_prompt:
+            lines.append("这个群的补充规则：")
+            lines.append(self.group_auto_reply_prompt)
+        lines.append("这条群消息的上下文：")
+        lines.append(json.dumps(metadata, ensure_ascii=False, indent=2))
+        lines.append(f"群成员发言：{cleaned}")
+        return "\n".join(lines)
+
+    def _decorate_group_audio_prompt_with_context(
+        self,
+        *,
+        chat_id: int,
+        chat_type: str,
+        msg: Dict[str, Any],
+        user: Dict[str, Any],
+        transcript: str,
+        caption: str,
+        message_ts: Optional[int],
+    ) -> str:
+        transcript_text = (transcript or "").strip()
+        caption_text = (caption or "").strip()
+        metadata = self._build_group_message_metadata(
+            chat_id=chat_id,
+            chat_type=chat_type,
+            msg=msg,
+            user=user,
+            source_kind="audio",
+            caption=caption_text,
+            message_ts=message_ts,
+        )
+        lines = []
+        if self.attach_time_context:
+            lines.append(self._build_message_context_timestamp(message_ts))
+        lines.append("你现在正在 Telegram 群聊里回复一条语音或音频消息，只在群里自然接话。")
+        if self.group_auto_reply_prompt:
+            lines.append("这个群的补充规则：")
+            lines.append(self.group_auto_reply_prompt)
+        lines.append("这条群消息的上下文：")
+        lines.append(json.dumps(metadata, ensure_ascii=False, indent=2))
+        if caption_text:
+            lines.append(f"群成员补充文字：{caption_text}")
+        lines.append(f"群成员语音转写：{transcript_text}")
+        return "\n".join(lines)
+
+    def _decorate_group_attachment_prompt_with_context(
+        self,
+        *,
+        chat_id: int,
+        chat_type: str,
+        msg: Dict[str, Any],
+        user: Dict[str, Any],
+        attachment: TelegramAttachment,
+        caption: str,
+        message_ts: Optional[int],
+    ) -> str:
+        caption_text = (caption or "").strip()
+        metadata = self._build_group_message_metadata(
+            chat_id=chat_id,
+            chat_type=chat_type,
+            msg=msg,
+            user=user,
+            source_kind="image" if attachment.is_image else "document",
+            caption=caption_text,
+            message_ts=message_ts,
+        )
+        intro = "群成员发来了一张图片" if attachment.is_image else "群成员发来了一个文件"
+        lines = []
+        if self.attach_time_context:
+            lines.append(self._build_message_context_timestamp(message_ts))
+        lines.append("你现在正在 Telegram 群聊里回复附件消息，只在群里自然接话。")
+        if self.group_auto_reply_prompt:
+            lines.append("这个群的补充规则：")
+            lines.append(self.group_auto_reply_prompt)
+        lines.append("这条群消息的上下文：")
+        lines.append(json.dumps(metadata, ensure_ascii=False, indent=2))
+        lines.append(intro)
+        if caption_text:
+            lines.append(f"群成员补充文字：{caption_text}")
+        lines.append(f"本地附件路径：{attachment.local_path}")
+        if attachment.is_image:
+            lines.append("请结合随附图片一起理解并回应；如果有需要，也可以读取这个路径里的文件。")
+        else:
+            lines.append("请先读取这个文件，再结合群成员的说明继续回应。")
+        return "\n".join(lines)
+
     def _decorate_text_prompt_with_context(self, text: str, message_ts: Optional[int]) -> str:
         cleaned = (text or "").strip()
         if not cleaned:
@@ -1760,7 +2071,7 @@ class TgCodexService:
 
     def _select_memories_for_prompt(
         self,
-        user_id: int,
+        user_id: StateActor,
         memory_query_text: Optional[str],
         active_id: Optional[str],
     ) -> List[Dict[str, Any]]:
@@ -1791,13 +2102,15 @@ class TgCodexService:
 
     def _decorate_prompt_with_memory_context(
         self,
-        user_id: int,
+        user_id: StateActor,
         prompt: str,
         memory_query_text: Optional[str],
         active_id: Optional[str],
     ) -> str:
         cleaned = (prompt or "").strip()
         if not cleaned:
+            return cleaned
+        if not isinstance(user_id, int):
             return cleaned
         if not self.memory_context_prompt:
             return cleaned
@@ -1817,7 +2130,9 @@ class TgCodexService:
             lines.append(f"- [{item.get('id')}] {pinned_prefix}{category_label}：{item.get('text')}")
         return "\n".join(lines) + "\n\n" + cleaned
 
-    def _build_memory_writeback_prompt(self, user_id: int, source_text: str) -> str:
+    def _build_memory_writeback_prompt(self, user_id: StateActor, source_text: str) -> str:
+        if not isinstance(user_id, int):
+            return ""
         if not self.memory_writeback_prompt:
             return ""
         recent_memories = self.memory_store.list_memories(user_id, limit=8)
@@ -1886,7 +2201,9 @@ class TgCodexService:
                 break
         return results
 
-    def _schedule_memory_writeback(self, user_id: int, cwd: Path, source_text: Optional[str]) -> None:
+    def _schedule_memory_writeback(self, user_id: StateActor, cwd: Path, source_text: Optional[str]) -> None:
+        if not isinstance(user_id, int):
+            return
         if not self.memory_auto_enabled:
             return
         if not self.memory_writeback_prompt:
@@ -2181,7 +2498,9 @@ class TgCodexService:
         photo = self._select_photo_media(msg.get("photo"))
         document = msg.get("document") if isinstance(msg.get("document"), dict) else None
 
-        chat_id = msg["chat"]["id"]
+        chat = msg.get("chat") or {}
+        chat_id = chat["id"]
+        chat_type = str(chat.get("type") or "").strip().lower()
         message_id = msg["message_id"]
         message_ts = self._coerce_int(msg.get("date"))
         user = msg.get("from") or {}
@@ -2189,6 +2508,9 @@ class TgCodexService:
 
         if user_id is None:
             return
+        user_allowed = self.allowed_user_ids is None or int(user_id) in self.allowed_user_ids
+        group_auto_reply = self._is_group_auto_reply_chat(int(chat_id), chat_type)
+        actor_id: StateActor = self._group_actor_id(int(chat_id)) if group_auto_reply else int(user_id)
         message_preview = text or caption
         log(
             f"update received: user_id={user_id} chat_id={chat_id} "
@@ -2196,66 +2518,115 @@ class TgCodexService:
             f"photo={bool(photo)} document={bool(document)}"
         )
 
-        if self.allowed_user_ids is not None and int(user_id) not in self.allowed_user_ids:
+        if not user_allowed and not group_auto_reply:
             log(f"blocked by allowlist: user_id={user_id}")
             self._send_message(chat_id, "没有权限使用这个 bot。", reply_to=message_id)
             return
+        if group_auto_reply and text.startswith("/") and not user_allowed:
+            log(f"group command ignored for non-allowlisted user: chat_id={chat_id} user_id={user_id}")
+            return
+        if group_auto_reply and not text.startswith("/"):
+            source_kind = "text"
+            if voice:
+                source_kind = "voice"
+            elif audio:
+                source_kind = "audio"
+            elif photo:
+                source_kind = "photo"
+            elif document:
+                source_kind = "document"
+            if not self._should_auto_reply_in_group(
+                chat_id=int(chat_id),
+                chat_type=chat_type,
+                actor_id=actor_id,
+                msg=msg,
+                user=user,
+                text=text,
+                caption=caption,
+                source_kind=source_kind,
+                message_ts=message_ts,
+            ):
+                return
 
-        self.state.touch_user(int(user_id), int(chat_id))
+        self.state.touch_user(actor_id, int(chat_id), at=message_ts)
 
         if not text:
             if voice:
                 self._handle_audio_message(
                     chat_id=chat_id,
                     reply_to=message_id,
-                    user_id=int(user_id),
+                    user_id=actor_id,
                     media=voice,
                     caption=caption,
                     kind="voice",
                     message_ts=message_ts,
+                    raw_message=msg,
+                    chat_type=chat_type,
+                    sender_user=user,
                 )
             elif audio:
                 self._handle_audio_message(
                     chat_id=chat_id,
                     reply_to=message_id,
-                    user_id=int(user_id),
+                    user_id=actor_id,
                     media=audio,
                     caption=caption,
                     kind="audio",
                     message_ts=message_ts,
+                    raw_message=msg,
+                    chat_type=chat_type,
+                    sender_user=user,
                 )
             elif photo:
                 self._handle_attachment_message(
                     chat_id=chat_id,
                     reply_to=message_id,
-                    user_id=int(user_id),
+                    user_id=actor_id,
                     media=photo,
                     caption=caption,
                     kind="photo",
                     message_ts=message_ts,
+                    raw_message=msg,
+                    chat_type=chat_type,
+                    sender_user=user,
                 )
             elif document:
                 self._handle_attachment_message(
                     chat_id=chat_id,
                     reply_to=message_id,
-                    user_id=int(user_id),
+                    user_id=actor_id,
                     media=document,
                     caption=caption,
                     kind="document",
                     message_ts=message_ts,
+                    raw_message=msg,
+                    chat_type=chat_type,
+                    sender_user=user,
                 )
             return
         if not text.startswith("/"):
-            if self._try_handle_quick_session_pick(chat_id, message_id, int(user_id), text):
+            if self._try_handle_quick_session_pick(chat_id, message_id, actor_id, text):
                 return
-            self.state.set_pending_session_pick(int(user_id), False)
-            self._handle_chat_message(chat_id, message_id, int(user_id), text, message_ts=message_ts)
+            self.state.set_pending_session_pick(actor_id, False)
+            self._handle_chat_message(
+                chat_id,
+                message_id,
+                actor_id,
+                text,
+                message_ts=message_ts,
+                raw_message=msg,
+                chat_type=chat_type,
+                sender_user=user,
+            )
             return
 
         cmd, arg = self._parse_command(text)
         log(f"command: /{cmd} arg={arg[:80]!r}")
         if cmd in ("start", "help"):
             self._send_help(chat_id, message_id)
+            return
+        if group_auto_reply:
+            self._send_message(chat_id, "群里只保留自然聊天，命令请回私聊使用。", reply_to=message_id)
             return
         if cmd == "sessions":
             self._handle_sessions(chat_id, message_id, arg, int(user_id))
@@ -2767,28 +3138,47 @@ class TgCodexService:
         self,
         chat_id: int,
         reply_to: int,
-        user_id: int,
+        user_id: StateActor,
         text: str,
         message_ts: Optional[int] = None,
+        raw_message: Optional[Dict[str, Any]] = None,
+        chat_type: str = "",
+        sender_user: Optional[Dict[str, Any]] = None,
     ) -> None:
+        if self._is_group_auto_reply_chat(chat_id, chat_type):
+            prompt = self._decorate_group_text_prompt_with_context(
+                chat_id=chat_id,
+                chat_type=chat_type,
+                msg=raw_message or {},
+                user=sender_user or {},
+                text=text,
+                message_ts=message_ts,
+            )
+            trigger_hint = TTS_TRIGGER_NONE
+        else:
+            prompt = self._decorate_text_prompt_with_context(text, message_ts)
+            trigger_hint = self._resolve_reply_tts_trigger(user_id if isinstance(user_id, int) else None, text, source_kind="text")
         self._run_prompt(
             chat_id,
             reply_to,
             user_id,
-            self._decorate_text_prompt_with_context(text, message_ts),
+            prompt,
             memory_source_text=text,
-            voice_trigger_hint=self._resolve_reply_tts_trigger(user_id, text, source_kind="text"),
+            voice_trigger_hint=trigger_hint,
         )
 
     def _handle_audio_message(
         self,
         chat_id: int,
         reply_to: int,
-        user_id: int,
+        user_id: StateActor,
         media: Dict[str, Any],
         caption: str,
         kind: str,
         message_ts: Optional[int] = None,
+        raw_message: Optional[Dict[str, Any]] = None,
+        chat_type: str = "",
+        sender_user: Optional[Dict[str, Any]] = None,
     ) -> None:
         if self.audio_transcriber is None:
             self._send_message(
@@ -2829,7 +3219,21 @@ class TgCodexService:
             )
         worker = threading.Thread(
             target=self._run_audio_prompt_worker,
-            args=(chat_id, reply_to, user_id, active_id, cwd, session_label, media, caption, kind, message_ts),
+            args=(
+                chat_id,
+                reply_to,
+                user_id,
+                active_id,
+                cwd,
+                session_label,
+                media,
+                caption,
+                kind,
+                message_ts,
+                raw_message,
+                chat_type,
+                sender_user,
+            ),
             daemon=True,
         )
         try:
@@ -2842,11 +3246,14 @@ class TgCodexService:
         self,
         chat_id: int,
         reply_to: int,
-        user_id: int,
+        user_id: StateActor,
         media: Dict[str, Any],
         caption: str,
         kind: str,
         message_ts: Optional[int] = None,
+        raw_message: Optional[Dict[str, Any]] = None,
+        chat_type: str = "",
+        sender_user: Optional[Dict[str, Any]] = None,
     ) -> None:
         file_id = str(media.get("file_id") or "").strip()
         if not file_id:
@@ -2880,7 +3287,21 @@ class TgCodexService:
 
         worker = threading.Thread(
             target=self._run_attachment_prompt_worker,
-            args=(chat_id, reply_to, user_id, active_id, cwd, session_label, media, caption, kind, message_ts),
+            args=(
+                chat_id,
+                reply_to,
+                user_id,
+                active_id,
+                cwd,
+                session_label,
+                media,
+                caption,
+                kind,
+                message_ts,
+                raw_message,
+                chat_type,
+                sender_user,
+            ),
             daemon=True,
         )
         try:
@@ -3271,7 +3692,7 @@ class TgCodexService:
         self,
         chat_id: int,
         reply_to: int,
-        user_id: int,
+        user_id: StateActor,
         active_id: Optional[str],
         cwd: Path,
         session_label: str,
@@ -3279,6 +3700,9 @@ class TgCodexService:
         caption: str,
         kind: str,
         message_ts: Optional[int] = None,
+        raw_message: Optional[Dict[str, Any]] = None,
+        chat_type: str = "",
+        sender_user: Optional[Dict[str, Any]] = None,
     ) -> None:
         if self.audio_transcriber is None:
             self.running_prompts.finish(user_id, active_id)
@@ -3319,7 +3743,20 @@ class TgCodexService:
             self.running_prompts.finish(user_id, active_id)
             return
 
-        prompt = self._decorate_audio_prompt_with_context(transcript, caption, message_ts)
+        if self._is_group_auto_reply_chat(chat_id, chat_type):
+            prompt = self._decorate_group_audio_prompt_with_context(
+                chat_id=chat_id,
+                chat_type=chat_type,
+                msg=raw_message or {},
+                user=sender_user or {},
+                transcript=transcript,
+                caption=caption,
+                message_ts=message_ts,
+            )
+            trigger_hint = TTS_TRIGGER_NONE
+        else:
+            prompt = self._decorate_audio_prompt_with_context(transcript, caption, message_ts)
+            trigger_hint = self._resolve_reply_tts_trigger(user_id if isinstance(user_id, int) else None, transcript, source_kind=kind)
         log(
             f"audio transcription finished: user_id={user_id} kind={kind} "
             f"session={active_id} transcript_len={len(transcript)}"
@@ -3333,14 +3770,14 @@ class TgCodexService:
             cwd=cwd,
             session_label=session_label,
             memory_source_text="\n".join(part for part in [caption.strip(), transcript] if part.strip()),
-            voice_trigger_hint=self._resolve_reply_tts_trigger(user_id, transcript, source_kind=kind),
+            voice_trigger_hint=trigger_hint,
         )
 
     def _run_attachment_prompt_worker(
         self,
         chat_id: int,
         reply_to: int,
-        user_id: int,
+        user_id: StateActor,
         active_id: Optional[str],
         cwd: Path,
         session_label: str,
@@ -3348,6 +3785,9 @@ class TgCodexService:
         caption: str,
         kind: str,
         message_ts: Optional[int] = None,
+        raw_message: Optional[Dict[str, Any]] = None,
+        chat_type: str = "",
+        sender_user: Optional[Dict[str, Any]] = None,
     ) -> None:
         typing = TypingStatus(self.api, chat_id)
         typing.start()
@@ -3361,7 +3801,20 @@ class TgCodexService:
         finally:
             typing.stop()
 
-        prompt = self._decorate_attachment_prompt_with_context(attachment, caption, message_ts)
+        if self._is_group_auto_reply_chat(chat_id, chat_type):
+            prompt = self._decorate_group_attachment_prompt_with_context(
+                chat_id=chat_id,
+                chat_type=chat_type,
+                msg=raw_message or {},
+                user=sender_user or {},
+                attachment=attachment,
+                caption=caption,
+                message_ts=message_ts,
+            )
+            trigger_hint = TTS_TRIGGER_NONE
+        else:
+            prompt = self._decorate_attachment_prompt_with_context(attachment, caption, message_ts)
+            trigger_hint = self._resolve_reply_tts_trigger(user_id if isinstance(user_id, int) else None, caption, source_kind=kind)
         image_paths = [attachment.local_path] if attachment.is_image else None
         log(
             f"attachment ready: user_id={user_id} kind={kind} session={active_id} "
@@ -3377,7 +3830,7 @@ class TgCodexService:
             session_label=session_label,
             image_paths=image_paths,
             memory_source_text=caption,
-            voice_trigger_hint=self._resolve_reply_tts_trigger(user_id, caption, source_kind=kind),
+            voice_trigger_hint=trigger_hint,
         )
 
     def _run_tts_callback_worker(
@@ -3546,6 +3999,15 @@ def build_service() -> TgCodexService:
     tg_reply_to_messages = parse_bool_env(env("TG_REPLY_TO_MESSAGES"), False)
     tg_attach_time_context = parse_bool_env(env("TG_ATTACH_TIME_CONTEXT"), True)
     tg_user_display_name = env("TG_USER_DISPLAY_NAME", "对方")
+    tg_group_auto_reply_chat_ids = parse_chat_ids(
+        env("TG_GROUP_AUTO_REPLY_CHAT_IDS"),
+        env_name="TG_GROUP_AUTO_REPLY_CHAT_IDS",
+    )
+    tg_group_auto_reply_prompt = _load_text_override(
+        GROUP_AUTO_REPLY_PROMPT,
+        inline_env_name="TG_GROUP_AUTO_REPLY_PROMPT",
+        path_env_name="TG_GROUP_AUTO_REPLY_PROMPT_PATH",
+    )
     tg_new_thread_persona_enabled = parse_bool_env(env("TG_NEW_THREAD_PERSONA_ENABLED"), True)
     tg_new_thread_persona_prompt = _load_text_override(
         NEW_THREAD_PERSONA_PROMPT,
@@ -3732,6 +4194,15 @@ def build_service() -> TgCodexService:
         "[info] Telegram memory "
         f"(path: {memory_path}, auto writeback: {'enabled' if memory_auto_enabled else 'disabled'})"
     )
+    if tg_group_auto_reply_chat_ids:
+        log(
+            "[info] Telegram group auto-reply enabled "
+            f"(chat_ids: {sorted(tg_group_auto_reply_chat_ids)})"
+        )
+        if not tg_group_auto_reply_prompt:
+            log("[warn] Telegram group auto-reply prompt is blank; only the default relevance rules will apply")
+    else:
+        log("[info] Telegram group auto-reply disabled")
     if not tg_new_thread_persona_prompt:
         log("[info] Telegram new-thread persona prompt is blank by default")
     if not tg_heartbeat_session_prompt:
@@ -3786,6 +4257,8 @@ def build_service() -> TgCodexService:
         memory_context_prompt=tg_memory_context_prompt,
         memory_writeback_prompt=tg_memory_writeback_prompt,
         memory_auto_enabled=memory_auto_enabled,
+        group_auto_reply_chat_ids=tg_group_auto_reply_chat_ids,
+        group_auto_reply_prompt=tg_group_auto_reply_prompt,
         tts_backend=tg_tts_backend,
         tts_mode=tg_tts_mode,
         tts_max_chars=tg_tts_max_chars,

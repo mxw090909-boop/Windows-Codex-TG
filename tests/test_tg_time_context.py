@@ -101,7 +101,15 @@ class TelegramTimeContextTests(unittest.TestCase):
         service = self.build_service("chat_message")
         captured = {}
 
-        def fake_run_prompt(chat_id, reply_to, user_id, prompt, image_paths=None, memory_source_text=None):
+        def fake_run_prompt(
+            chat_id,
+            reply_to,
+            user_id,
+            prompt,
+            image_paths=None,
+            memory_source_text=None,
+            voice_trigger_hint=None,
+        ):
             captured["chat_id"] = chat_id
             captured["reply_to"] = reply_to
             captured["user_id"] = user_id

@@ -41,15 +41,16 @@ export TG_THINKING_STATUS_INTERVAL_MS=700             # 可选，思考状态刷
 export TG_MEMORY_PATH="./bot_memory.json"             # 可选，Telegram 记忆文件路径
 export TG_MEMORY_AUTO_ENABLED=1                       # 可选，默认 1；只有配置本地记忆写回提示词时才会真的自动写回
 export TG_USER_DISPLAY_NAME="friend"                  # 可选，默认 "对方"，供本地提示词模板引用
+export TG_GROUP_AUTO_REPLY_CHAT_IDS="-1001234567890" # 可选，逗号分隔的 Telegram 群 / 超级群 chat_id
 export TG_VOICE_TRANSCRIBE_ENABLED=1                  # 可选；不设置时 run.sh 会在本地环境就绪时自动启用
 export TG_VOICE_TRANSCRIBE_BACKEND="local-whisper"    # 可选，默认 local-whisper
 export TG_VOICE_MAX_BYTES=26214400                    # 可选，允许转写的 Telegram 音频最大字节数
 
 # 本地 Whisper 模式（不走外部 API）
 export TG_VOICE_LOCAL_MODEL="base"                    # 可选
-export TG_VOICE_LOCAL_DEVICE="cpu"                    # 可选：cpu | cuda | mps
+export TG_VOICE_LOCAL_DEVICE="cpu"                    # 可选：cpu | cuda
 export TG_VOICE_LOCAL_LANGUAGE="zh"                   # 可选
-export TG_VOICE_FFMPEG_BIN="/opt/homebrew/bin/ffmpeg" # 可选，不填则自动探测
+export TG_VOICE_FFMPEG_BIN="C:/path/to/ffmpeg.exe"    # 可选，不填则自动探测
 
 # OpenAI 模式（可作为兜底）
 export OPENAI_API_KEY="sk-..."                        # 仅 backend=openai 时需要
@@ -72,7 +73,7 @@ export WECHAT_SEND_TYPING=1
 
 # 通用（可选）
 export DEFAULT_CWD="/path/to/your/project/codex-tg"
-export CODEX_BIN="/Applications/Codex.app/Contents/Resources/codex"
+export CODEX_BIN="$(command -v codex)"               # 可选：如果 codex 已在 PATH 里，这行可以省略
 export CODEX_SESSION_ROOT="$HOME/.codex/sessions"
 export CODEX_SANDBOX_MODE=""                         # 可选：仅 CODEX_DANGEROUS_BYPASS=1 时生效
 export CODEX_APPROVAL_POLICY=""                      # 可选：仅 CODEX_DANGEROUS_BYPASS=1 时生效
@@ -85,6 +86,7 @@ export TG_HEARTBEAT_TEMPLATE_MESSAGES_PATH="./.local-prompts/heartbeat-template-
 export TG_HEARTBEAT_FOLLOWUP_TEMPLATE_MESSAGES_PATH="./.local-prompts/heartbeat-followup-template-messages.txt"
 export TG_MEMORY_CONTEXT_PROMPT_PATH="./.local-prompts/memory-context.txt"
 export TG_MEMORY_WRITEBACK_PROMPT_PATH="./.local-prompts/memory-writeback.txt"
+export TG_GROUP_AUTO_REPLY_PROMPT_PATH="./.local-prompts/group-auto-reply.txt"
 ```
 
 ### 2) 启动服务
@@ -221,6 +223,18 @@ Telegram 的图片和文件消息会先下载到当前会话工作目录下的 `
 - 图片消息会作为图片附件直接带进 Codex 的初始 prompt
 - 以图片形式发送的 document 也会被当作图片附件处理，所有文件都会保存在本地，方便 Codex 按路径读取
 - caption 会作为补充说明，一起带给 Codex
+
+## Telegram 群聊自动回复
+
+你可以只在指定的 Telegram 群或超级群里开启自然接话式自动回复。
+
+说明：
+
+- 通过 `TG_GROUP_AUTO_REPLY_CHAT_IDS` 指定要启用的群 chat_id；不在列表里的群不会启用这套逻辑
+- bot 会先跑一次轻量 gate 判断，只有返回 `{"action":"send"}` 才真的接话
+- 群聊回复会使用单独的 group actor / session，不会把群里的上下文串进你的私聊会话
+- 配好的群里不开放 slash 命令；有人在群里发命令时，bot 会提示回私聊使用
+- 如果你有群专属规则，放到 `TG_GROUP_AUTO_REPLY_PROMPT_PATH` 指向的本地文件里；仓库内置默认提示词保持中立、客观
 
 ## Telegram 记忆
 

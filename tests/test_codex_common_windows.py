@@ -27,6 +27,17 @@ class FakeProcess:
 
 
 class CodexRunnerWindowsTests(unittest.TestCase):
+    def test_resolve_codex_bin_returns_configured_value(self) -> None:
+        self.assertEqual(codex_common.resolve_codex_bin("custom-codex"), "custom-codex")
+
+    def test_resolve_codex_bin_prefers_codex_from_path(self) -> None:
+        with patch("codex_common.shutil.which", return_value=r"C:\tools\codex.exe"):
+            self.assertEqual(codex_common.resolve_codex_bin(None), r"C:\tools\codex.exe")
+
+    def test_resolve_codex_bin_falls_back_to_command_name(self) -> None:
+        with patch("codex_common.shutil.which", return_value=None):
+            self.assertEqual(codex_common.resolve_codex_bin(None), "codex")
+
     def test_windows_hidden_popen_kwargs_hide_console(self) -> None:
         with patch("codex_common.os.name", "nt"), patch.object(
             codex_common.subprocess,

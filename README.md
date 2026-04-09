@@ -42,15 +42,16 @@ export TG_THINKING_STATUS_INTERVAL_MS=700             # optional, thinking statu
 export TG_MEMORY_PATH="./bot_memory.json"             # optional, Telegram memory store path
 export TG_MEMORY_AUTO_ENABLED=1                       # optional, default 1; auto writeback only runs when a private writeback prompt is configured
 export TG_USER_DISPLAY_NAME="friend"                  # optional, default "对方" in local prompt wrappers
+export TG_GROUP_AUTO_REPLY_CHAT_IDS="-1001234567890" # optional, comma-separated Telegram group/supergroup chat ids
 export TG_VOICE_TRANSCRIBE_ENABLED=1                  # optional; if unset, run.sh auto-enables when local env is ready
 export TG_VOICE_TRANSCRIBE_BACKEND="local-whisper"    # optional, default local-whisper
 export TG_VOICE_MAX_BYTES=26214400                    # optional, max Telegram audio bytes to transcribe
 
 # Local Whisper backend (no external API)
 export TG_VOICE_LOCAL_MODEL="base"                    # optional
-export TG_VOICE_LOCAL_DEVICE="cpu"                    # optional: cpu | cuda | mps
+export TG_VOICE_LOCAL_DEVICE="cpu"                    # optional: cpu | cuda
 export TG_VOICE_LOCAL_LANGUAGE="zh"                   # optional
-export TG_VOICE_FFMPEG_BIN="/opt/homebrew/bin/ffmpeg" # optional, auto-detected if omitted
+export TG_VOICE_FFMPEG_BIN="C:/path/to/ffmpeg.exe"    # optional, auto-detected if omitted
 
 # OpenAI backend (optional fallback)
 export OPENAI_API_KEY="sk-..."                        # required only when backend=openai
@@ -73,7 +74,7 @@ export WECHAT_SEND_TYPING=1
 
 # Shared (optional)
 export DEFAULT_CWD="/path/to/your/project/codex-tg"
-export CODEX_BIN="/Applications/Codex.app/Contents/Resources/codex"
+export CODEX_BIN="$(command -v codex)"               # optional: omit this if codex is already in PATH
 export CODEX_SESSION_ROOT="$HOME/.codex/sessions"
 export CODEX_SANDBOX_MODE=""                         # optional: used only when CODEX_DANGEROUS_BYPASS=1
 export CODEX_APPROVAL_POLICY=""                      # optional: used only when CODEX_DANGEROUS_BYPASS=1
@@ -86,6 +87,7 @@ export TG_HEARTBEAT_TEMPLATE_MESSAGES_PATH="./.local-prompts/heartbeat-template-
 export TG_HEARTBEAT_FOLLOWUP_TEMPLATE_MESSAGES_PATH="./.local-prompts/heartbeat-followup-template-messages.txt"
 export TG_MEMORY_CONTEXT_PROMPT_PATH="./.local-prompts/memory-context.txt"
 export TG_MEMORY_WRITEBACK_PROMPT_PATH="./.local-prompts/memory-writeback.txt"
+export TG_GROUP_AUTO_REPLY_PROMPT_PATH="./.local-prompts/group-auto-reply.txt"
 ```
 
 ### 2) Start services
@@ -228,6 +230,18 @@ Notes:
 - Image documents are also attached as images, and all files are saved locally so Codex can inspect them by path
 - Captions are included as extra context alongside the downloaded file
 
+## Telegram Group Auto Reply
+
+You can enable natural auto-replies in selected Telegram groups or supergroups.
+
+Notes:
+
+- Set `TG_GROUP_AUTO_REPLY_CHAT_IDS` to the target chat IDs; chats not listed keep the existing private-chat behavior
+- The bot runs a lightweight Codex gate first and only replies when that gate returns `{"action":"send"}`
+- Group replies reuse a group-scoped actor/session key so the bot does not mix that context into your private chat session
+- Slash commands stay private-first; in configured groups the bot tells users to use commands in direct messages instead
+- Keep any group-specific behavior in `TG_GROUP_AUTO_REPLY_PROMPT_PATH`; the built-in default prompt stays neutral and objective
+
 ## Telegram TTS Replies
 
 Telegram can also offer an optional voice reply after a normal text response.
@@ -237,7 +251,7 @@ Notes:
 - Text replies still go out as normal first
 - `TG_TTS_MODE=auto` only sends voice for short conversational replies and skips code blocks, file paths, command output, and long responses
 - The bot can mix voice and text inside one reply; it decides which chunks are worth speaking and keeps the rest as normal text
-- `/voice` lets you configure the current Telegram user's TTS credentials and voice frequency directly in chat
+- `/voice` lets you configure the current Telegram user's TTS credentials directly in chat
 - Default MiniMax CN config looks like this:
 
 ```bash
@@ -254,7 +268,6 @@ Then configure your user-specific credentials in Telegram:
 ```text
 /voice key <YOUR_API_KEY>
 /voice voice <voice_id>
-/voice freq <high|medium|low>
 ```
 
 ## Telegram Memory

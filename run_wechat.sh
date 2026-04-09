@@ -18,7 +18,7 @@ WECHAT_REQUIRE_ALLOWLIST="${WECHAT_REQUIRE_ALLOWLIST:-1}"
 WECHAT_POLL_TIMEOUT_SEC="${WECHAT_POLL_TIMEOUT_SEC:-35}"
 WECHAT_SEND_TYPING="${WECHAT_SEND_TYPING:-1}"
 DEFAULT_CWD="${DEFAULT_CWD:-$SCRIPT_DIR}"
-CODEX_BIN="${CODEX_BIN:-/Applications/Codex.app/Contents/Resources/codex}"
+CODEX_BIN="${CODEX_BIN:-}"
 CODEX_SESSION_ROOT="${CODEX_SESSION_ROOT:-$HOME/.codex/sessions}"
 CODEX_SANDBOX_MODE="${CODEX_SANDBOX_MODE:-}"
 CODEX_APPROVAL_POLICY="${CODEX_APPROVAL_POLICY:-}"
@@ -26,7 +26,17 @@ CODEX_DANGEROUS_BYPASS="${CODEX_DANGEROUS_BYPASS:-0}"
 
 ACCOUNT_FILE="$WECHAT_RUNTIME_DIR/account.json"
 
+resolve_codex_bin() {
+  if [[ -n "$CODEX_BIN" ]]; then
+    return 0
+  fi
+  if command -v codex >/dev/null 2>&1; then
+    CODEX_BIN="$(command -v codex)"
+  fi
+}
+
 fail_if_not_configured() {
+  resolve_codex_bin
   if [[ ! -x "$CODEX_BIN" ]]; then
     echo "[error] CODEX_BIN 不存在或不可执行: $CODEX_BIN"
     exit 1

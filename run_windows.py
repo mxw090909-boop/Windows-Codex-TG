@@ -45,18 +45,22 @@ def configure_stdio() -> None:
 
 
 def info(message: str) -> None:
+    configure_stdio()
     print(f"[info] {message}")
 
 
 def ok(message: str) -> None:
+    configure_stdio()
     print(f"[ok] {message}")
 
 
 def warn(message: str) -> None:
+    configure_stdio()
     print(f"[warn] {message}")
 
 
 def fail(message: str) -> None:
+    configure_stdio()
     print(f"[error] {message}", file=sys.stderr)
     raise SystemExit(1)
 

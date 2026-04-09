@@ -1342,7 +1342,4 @@ def resolve_codex_bin(configured: Optional[str]) -> str:
     found = shutil.which("codex")
     if found:
         return found
-    app_path = "/Applications/Codex.app/Contents/Resources/codex"
-    if Path(app_path).exists():
-        return app_path
     return "codex"

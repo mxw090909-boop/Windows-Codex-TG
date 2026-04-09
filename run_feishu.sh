@@ -22,14 +22,24 @@ FEISHU_STREAM_MIN_DELTA_CHARS="${FEISHU_STREAM_MIN_DELTA_CHARS:-12}"
 FEISHU_THINKING_STATUS_INTERVAL_MS="${FEISHU_THINKING_STATUS_INTERVAL_MS:-900}"
 FEISHU_IGNORE_OLD_MESSAGE_SECONDS="${FEISHU_IGNORE_OLD_MESSAGE_SECONDS:-180}"
 DEFAULT_CWD="${DEFAULT_CWD:-$SCRIPT_DIR}"
-CODEX_BIN="${CODEX_BIN:-/Applications/Codex.app/Contents/Resources/codex}"
+CODEX_BIN="${CODEX_BIN:-}"
 CODEX_SESSION_ROOT="${CODEX_SESSION_ROOT:-$HOME/.codex/sessions}"
 CODEX_SANDBOX_MODE="${CODEX_SANDBOX_MODE:-}"
 CODEX_APPROVAL_POLICY="${CODEX_APPROVAL_POLICY:-}"
 CODEX_DANGEROUS_BYPASS="${CODEX_DANGEROUS_BYPASS:-0}"
 # ======================================================
 
+resolve_codex_bin() {
+  if [[ -n "$CODEX_BIN" ]]; then
+    return 0
+  fi
+  if command -v codex >/dev/null 2>&1; then
+    CODEX_BIN="$(command -v codex)"
+  fi
+}
+
 fail_if_not_configured() {
+  resolve_codex_bin
   if [[ -z "$FEISHU_APP_ID" ]]; then
     echo "[error] 缺少环境变量 FEISHU_APP_ID"
     exit 1
